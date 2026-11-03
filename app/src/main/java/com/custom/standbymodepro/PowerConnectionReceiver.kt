@@ -1,0 +1,25 @@
+package com.custom.standbymodepro
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.provider.Settings
+
+class PowerConnectionReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        when (intent.action) {
+            Intent.ACTION_POWER_CONNECTED -> {
+                if (Settings.canDrawOverlays(context)) {
+                    val launchIntent = Intent(context, MainActivity::class.java).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                    }
+                    context.startActivity(launchIntent)
+                }
+            }
+            Intent.ACTION_POWER_DISCONNECTED -> {
+                val closeIntent = Intent("com.custom.standbymodepro.ACTION_CLOSE_STANDBY")
+                context.sendBroadcast(closeIntent)
+            }
+        }
+    }
+}
