@@ -46,11 +46,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.YearMonth
-import java.time.format.DateTimeFormatter
 import java.time.format.TextStyle
 import java.util.Locale
 import kotlin.math.cos
@@ -59,7 +59,7 @@ import kotlin.random.Random
 
 class MainActivity : ComponentActivity(), SensorEventListener {
 
-    private lateinit var sensorManager: SensorManager
+    private var sensorManager: SensorManager? = null
     private var lightSensor: Sensor? = null
     private var currentLux by mutableFloatStateOf(100f)
 
@@ -72,87 +72,91 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Show over lockscreen & keep screen on
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-            setShowWhenLocked(true)
-            setTurnScreenOn(true)
-            val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-            keyguardManager.requestDismissKeyguard(this, null)
-        } else {
-            @Suppress("DEPRECATION")
-            window.addFlags(
-                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-                        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
-                        WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
-            )
-        }
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                setShowWhenLocked(true)
+                setTurnScreenOn(true)
+                val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                keyguardManager?.requestDismissKeyguard(this, null)
+            } else {
+                @Suppress("DEPRECATION")
+                window.addFlags(
+                    WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                            WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                            WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
+                )
+            }
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } catch (_: Exception) {}
 
-        hideSystemUI()
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+        lightSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_LIGHT)
 
-        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        lightSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(
+        try {
+            ContextCompat.registerReceiver(
+                this,
                 closeReceiver,
                 IntentFilter("com.custom.standbymodepro.ACTION_CLOSE_STANDBY"),
-                Context.RECEIVER_NOT_EXPORTED
+                ContextCompat.RECEIVER_NOT_EXPORTED
             )
-        } else {
-            registerReceiver(
-                closeReceiver,
-                IntentFilter("com.custom.standbymodepro.ACTION_CLOSE_STANDBY")
-            )
-        }
+        } catch (_: Exception) {}
 
         setContent {
             StandByScreen(
                 ambientLux = currentLux,
                 onRequestOverlayPermission = {
-                    if (!Settings.canDrawOverlays(this)) {
-                        val intent = Intent(
-                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                            Uri.parse("package:$packageName")
-                        )
-                        startActivity(intent)
-                    }
+                    try {
+                        if (!Settings.canDrawOverlays(this)) {
+                            val intent = Intent(
+                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:$packageName")
+                            )
+                            startActivity(intent)
+                        }
+                    } catch (_: Exception) {}
                 }
             )
+        }
+
+        // Вызываем скрытие статус-бара ТОЛЬКО после того, как окно создано в setContent
+        window.decorView.post {
+            hideSystemUI()
         }
     }
 
     private fun hideSystemUI() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.setDecorFitsSystemWindows(false)
-            window.insetsController?.let {
-                it.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
-                it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                window.setDecorFitsSystemWindows(false)
+                window.insetsController?.let {
+                    it.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                    it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                window.decorView.systemUiVisibility = (
+                        View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                                or View.SYSTEM_UI_FLAG_FULLSCREEN
+                                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        )
             }
-        } else {
-            @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility = (
-                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                            or View.SYSTEM_UI_FLAG_FULLSCREEN
-                            or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                            or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                            or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                            or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                    )
-        }
+        } catch (_: Exception) {}
     }
 
     override fun onResume() {
         super.onResume()
-        hideSystemUI()
+        window.decorView.post { hideSystemUI() }
         lightSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
         }
     }
 
     override fun onPause() {
         super.onPause()
-        sensorManager.unregisterListener(this)
+        sensorManager?.unregisterListener(this)
     }
 
     override fun onDestroy() {
@@ -183,18 +187,15 @@ fun StandByScreen(
     var currentTime by remember { mutableStateOf(LocalTime.now()) }
     var currentDate by remember { mutableStateOf(LocalDate.now()) }
 
-    // Settings state
     var clockStyle by remember { mutableStateOf(ClockStyle.FLIP) }
     var rightWidget by remember { mutableStateOf(RightWidget.CALENDAR) }
     var autoNightMode by remember { mutableStateOf(true) }
     var manualNightMode by remember { mutableStateOf(false) }
     var showControls by remember { mutableStateOf(true) }
 
-    // Burn-in protection pixel shift (-12..12 px every minute)
     var burnInOffsetX by remember { mutableIntStateOf(0) }
     var burnInOffsetY by remember { mutableIntStateOf(0) }
 
-    // Battery state
     var batteryPct by remember { mutableIntStateOf(100) }
     var isCharging by remember { mutableStateOf(false) }
 
@@ -213,7 +214,6 @@ fun StandByScreen(
         label = "cardBg"
     )
 
-    // Clock & Burn-in protection ticker
     LaunchedEffect(Unit) {
         var lastMinute = -1
         while (true) {
@@ -226,22 +226,22 @@ fun StandByScreen(
                 burnInOffsetX = Random.nextInt(-12, 13)
                 burnInOffsetY = Random.nextInt(-12, 13)
 
-                // Read battery
-                val bm = context.registerReceiver(null, IntentFilter(ACTION_BATTERY_CHANGED))
-                val level = bm?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-                val scale = bm?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-                val status = bm?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
-                if (level >= 0 && scale > 0) {
-                    batteryPct = (level * 100) / scale
-                }
-                isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
-                        status == BatteryManager.BATTERY_STATUS_FULL
+                try {
+                    val bm = context.registerReceiver(null, IntentFilter(ACTION_BATTERY_CHANGED))
+                    val level = bm?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                    val scale = bm?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+                    val status = bm?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+                    if (level >= 0 && scale > 0) {
+                        batteryPct = (level * 100) / scale
+                    }
+                    isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                            status == BatteryManager.BATTERY_STATUS_FULL
+                } catch (_: Exception) {}
             }
             delay(1000L)
         }
     }
 
-    // Auto-hide top toolbar after 6 seconds
     LaunchedEffect(showControls) {
         if (showControls) {
             delay(6000L)
@@ -259,7 +259,6 @@ fun StandByScreen(
             ) { showControls = !showControls }
             .padding(24.dp)
     ) {
-        // Main Dual-Widget Container with Burn-In Offset
         Row(
             modifier = Modifier
                 .fillMaxSize()
@@ -267,7 +266,6 @@ fun StandByScreen(
             horizontalArrangement = Arrangement.spacedBy(24.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // LEFT SIDE: CLOCK (55% width)
             Box(
                 modifier = Modifier
                     .weight(1.15f)
@@ -294,7 +292,6 @@ fun StandByScreen(
                 }
             }
 
-            // RIGHT SIDE: WIDGET (45% width)
             Box(
                 modifier = Modifier
                     .weight(0.85f)
@@ -325,7 +322,6 @@ fun StandByScreen(
             }
         }
 
-        // Top Floating Control Bar (visible on tap)
         if (showControls) {
             Row(
                 modifier = Modifier
@@ -336,7 +332,6 @@ fun StandByScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Switch Clock Style
                 TextButton(onClick = {
                     clockStyle = ClockStyle.entries[(clockStyle.ordinal + 1) % ClockStyle.entries.size]
                 }) {
@@ -345,7 +340,6 @@ fun StandByScreen(
                     Text("Часы: ${clockStyle.name}", color = Color.White, fontSize = 13.sp)
                 }
 
-                // Switch Right Widget
                 TextButton(onClick = {
                     rightWidget = RightWidget.entries[(rightWidget.ordinal + 1) % RightWidget.entries.size]
                 }) {
@@ -354,7 +348,6 @@ fun StandByScreen(
                     Text("Виджет: ${rightWidget.name}", color = Color.White, fontSize = 13.sp)
                 }
 
-                // Toggle Night Red Mode
                 TextButton(onClick = {
                     manualNightMode = !manualNightMode
                 }) {
@@ -371,7 +364,6 @@ fun StandByScreen(
                     )
                 }
 
-                // Permission for Auto-start on charge
                 if (!Settings.canDrawOverlays(context)) {
                     TextButton(onClick = onRequestOverlayPermission) {
                         Icon(Icons.Default.Bolt, contentDescription = null, tint = Color(0xFFFFD60A))
@@ -433,12 +425,11 @@ fun FlipCard(
         Text(
             text = text,
             color = primaryColor,
-            fontSize = 128.sp,
+            fontSize = 110.sp,
             fontWeight = FontWeight.Bold,
             fontFamily = FontFamily.SansSerif,
             textAlign = TextAlign.Center
         )
-        // Horizontal split line for authentic flip-clock look
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -475,7 +466,7 @@ fun DigitalDuoClockView(
         Text(
             text = "$hourStr:$minStr",
             color = primaryColor,
-            fontSize = 136.sp,
+            fontSize = 120.sp,
             fontWeight = FontWeight.Black,
             letterSpacing = (-4).sp
         )
@@ -508,7 +499,6 @@ fun AnalogClockView(
             val radius = size.minDimension / 2f
             val center = Offset(size.width / 2f, size.height / 2f)
 
-            // Hour ticks
             for (i in 0 until 12) {
                 val angle = Math.toRadians((i * 30).toDouble() - 90)
                 val startR = radius * 0.84f
@@ -528,7 +518,6 @@ fun AnalogClockView(
                 )
             }
 
-            // Hour hand
             val hourAngle = Math.toRadians(((time.hour % 12) * 30 + time.minute * 0.5) - 90)
             drawLine(
                 color = primaryColor,
@@ -541,7 +530,6 @@ fun AnalogClockView(
                 cap = StrokeCap.Round
             )
 
-            // Minute hand
             val minAngle = Math.toRadians((time.minute * 6.0) - 90)
             drawLine(
                 color = primaryColor,
@@ -554,7 +542,6 @@ fun AnalogClockView(
                 cap = StrokeCap.Round
             )
 
-            // Second hand
             val secAngle = Math.toRadians((time.second * 6.0) - 90)
             drawLine(
                 color = accentColor,
@@ -583,7 +570,7 @@ fun CalendarWidgetView(
     val monthName = date.month.getDisplayName(TextStyle.FULL_STANDALONE, ruLocale).uppercase(ruLocale)
     val yearMonth = YearMonth.from(date)
     val daysInMonth = yearMonth.lengthOfMonth()
-    val firstDayOffset = yearMonth.atDay(1).dayOfWeek.value - 1 // Monday = 0
+    val firstDayOffset = yearMonth.atDay(1).dayOfWeek.value - 1
 
     Column(
         modifier = Modifier.fillMaxSize(),
@@ -593,27 +580,26 @@ fun CalendarWidgetView(
             Text(
                 text = dayOfWeek,
                 color = accentColor,
-                fontSize = 18.sp,
+                fontSize = 16.sp,
                 fontWeight = FontWeight.Bold,
                 letterSpacing = 1.5.sp
             )
             Text(
                 text = "${date.dayOfMonth} $monthName",
                 color = primaryColor,
-                fontSize = 32.sp,
+                fontSize = 26.sp,
                 fontWeight = FontWeight.ExtraBold
             )
         }
 
-        // Compact Month Grid
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             val weekDays = listOf("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС")
             Row(modifier = Modifier.fillMaxWidth()) {
                 weekDays.forEach { d ->
                     Text(
                         text = d,
                         color = primaryColor.copy(alpha = 0.45f),
-                        fontSize = 12.sp,
+                        fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
                         textAlign = TextAlign.Center,
                         modifier = Modifier.weight(1f)
@@ -633,7 +619,7 @@ fun CalendarWidgetView(
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
-                                    .aspectRatio(1.2f)
+                                    .height(24.dp)
                                     .clip(CircleShape)
                                     .background(if (isToday) accentColor else Color.Transparent),
                                 contentAlignment = Alignment.Center
@@ -641,7 +627,7 @@ fun CalendarWidgetView(
                                 Text(
                                     text = dayNum.toString(),
                                     color = if (isToday) Color.Black else primaryColor,
-                                    fontSize = 14.sp,
+                                    fontSize = 13.sp,
                                     fontWeight = if (isToday) FontWeight.ExtraBold else FontWeight.Medium
                                 )
                             }
@@ -690,7 +676,7 @@ fun TimerWidgetView(
         Text(
             text = String.format("%02d:%02d", mins, secs),
             color = primaryColor,
-            fontSize = 68.sp,
+            fontSize = 60.sp,
             fontWeight = FontWeight.Bold
         )
 
@@ -740,7 +726,7 @@ fun BatteryWidgetView(
         Text(
             text = "$batteryPct%",
             color = primaryColor,
-            fontSize = 64.sp,
+            fontSize = 60.sp,
             fontWeight = FontWeight.ExtraBold
         )
 
