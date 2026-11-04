@@ -69,6 +69,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var currentLux by mutableFloatStateOf(100f)
 
     private var portraitEnterTime = 0L
+    private var lastAccelProcessTime = 0L
 
     private val closeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -79,7 +80,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Плавное появление окна без вспышек и мигания
         overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out)
 
         try {
@@ -119,7 +119,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         } catch (_: Exception) {}
 
         setContent {
-            // Абсолютно черный холст без серых системных подложек
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -172,7 +171,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onResume() {
         super.onResume()
         portraitEnterTime = 0L
+        lastAccelProcessTime = 0L
         window.decorView.post { hideSystemUI() }
+        // Свет — нормальная частота, акселерометр — тоже, но с фильтрацией внутри
         lightSensor?.let {
             sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
         }
@@ -200,16 +201,20 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 currentLux = event.values[0]
             }
             Sensor.TYPE_ACCELEROMETER -> {
+                val now = System.currentTimeMillis()
+                // Обрабатываем акселерометр не чаще раза в 400 мс — экономия CPU
+                if (now - lastAccelProcessTime < 400L) return
+                lastAccelProcessTime = now
+
                 val x = event.values[0]
                 val y = event.values[1]
 
                 val isPortrait = abs(y) > 6.5f && abs(x) < 4.5f
-                val now = System.currentTimeMillis()
 
                 if (isPortrait) {
                     if (portraitEnterTime == 0L) {
                         portraitEnterTime = now
-                    } else if (now - portraitEnterTime > 600L) {
+                    } else if (now - portraitEnterTime > 800L) {
                         finish()
                     }
                 } else {
@@ -229,7 +234,6 @@ enum class DigitalClockStyle(val title: String) {
     TERMINAL("Терминал")
 }
 
-// 3 варианта календаря (везде сетка месяца, но разное расположение элементов)
 enum class CalendarLayoutStyle(val title: String) {
     LAYOUT_TOP("Дата сверху"),
     LAYOUT_BOTTOM("Дата снизу"),
@@ -243,9 +247,9 @@ enum class RightWidget(val title: String) {
 }
 
 enum class BrightnessMode(val title: String) {
-    AUTO("АВТО (15%/30%)"),
-    DAY_30("ДЕНЬ (30%)"),
-    NIGHT_15("НОЧЬ (15%)")
+    AUTO("АВТО (5%/10%)"),
+    DAY_10("ДЕНЬ (10%)"),
+    NIGHT_5("НОЧЬ (5%)")
 }
 
 data class ColorTheme(
@@ -287,13 +291,14 @@ fun StandByScreen(
     var batteryPct by remember { mutableIntStateOf(100) }
     var isCharging by remember { mutableStateOf(false) }
 
+    // Яркость: ночь 5%, день 10%
     val isNight = when (brightnessMode) {
         BrightnessMode.AUTO -> ambientLux < 8f
-        BrightnessMode.DAY_30 -> false
-        BrightnessMode.NIGHT_15 -> true
+        BrightnessMode.DAY_10 -> false
+        BrightnessMode.NIGHT_5 -> true
     }
 
-    val targetBrightness = if (isNight) 0.15f else 0.30f
+    val targetBrightness = if (isNight) 0.05f else 0.10f
     LaunchedEffect(targetBrightness) {
         (context as? Activity)?.window?.let { win ->
             val params = win.attributes
@@ -314,10 +319,24 @@ fun StandByScreen(
         label = "accentColor"
     )
 
-    // Антивыгорание OLED с медленной плавной сменой каждые 3–6 минут
+    // Обновление времени + burn-in + батарея
     LaunchedEffect(autoCycleOled) {
         var lastMinute = -1
         var minutesCounter = 0
+
+        // Один раз получаем стартовое значение батареи
+        try {
+            val bm = context.registerReceiver(null, IntentFilter(ACTION_BATTERY_CHANGED))
+            val level = bm?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = bm?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+            val status = bm?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+            if (level >= 0 && scale > 0) {
+                batteryPct = (level * 100) / scale
+            }
+            isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                    status == BatteryManager.BATTERY_STATUS_FULL
+        } catch (_: Exception) {}
+
         while (true) {
             val now = LocalTime.now()
             currentTime = now
@@ -327,11 +346,12 @@ fun StandByScreen(
                 lastMinute = now.minute
                 minutesCounter++
 
-                burnInOffsetX = Random.nextInt(-18, 19)
-                burnInOffsetY = Random.nextInt(-14, 15)
+                // Меньший сдвиг — меньше нагрузка + всё ещё защита OLED
+                burnInOffsetX = Random.nextInt(-12, 13)
+                burnInOffsetY = Random.nextInt(-10, 11)
 
                 if (autoCycleOled && minutesCounter > 1) {
-                    if (minutesCounter % 3 == 0) {
+                    if (minutesCounter % 4 == 0) {
                         clockStyle = DigitalClockStyle.entries[
                             (clockStyle.ordinal + 1) % DigitalClockStyle.entries.size
                         ]
@@ -339,11 +359,12 @@ fun StandByScreen(
                             (calendarStyle.ordinal + 1) % CalendarLayoutStyle.entries.size
                         ]
                     }
-                    if (minutesCounter % 6 == 0) {
+                    if (minutesCounter % 8 == 0) {
                         swapPanels = !swapPanels
                     }
                 }
 
+                // Обновляем батарею раз в минуту (sticky broadcast — дёшево)
                 try {
                     val bm = context.registerReceiver(null, IntentFilter(ACTION_BATTERY_CHANGED))
                     val level = bm?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
@@ -370,14 +391,13 @@ fun StandByScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF000000)) // Абсолютно черный OLED фон
+            .background(Color(0xFF000000))
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null
             ) { showControls = !showControls }
             .padding(24.dp)
     ) {
-        // Плавная 2-секундная смена сторон (лево <-> право)
         AnimatedContent(
             targetState = swapPanels,
             transitionSpec = {
@@ -437,7 +457,6 @@ fun StandByScreen(
             }
         }
 
-        // Верхняя панель управления
         if (showControls) {
             Row(
                 modifier = Modifier
@@ -545,7 +564,6 @@ fun ClockContainer(
         modifier = modifier,
         contentAlignment = Alignment.Center
     ) {
-        // Медленная 2-секундная плавная анимация смены циферблатов
         AnimatedContent(
             targetState = clockStyle,
             transitionSpec = {
@@ -585,7 +603,6 @@ fun WidgetContainer(
     ) {
         when (rightWidget) {
             RightWidget.CALENDAR -> {
-                // Медленная 2-секундная плавная анимация смены макетов календаря
                 AnimatedContent(
                     targetState = calendarStyle,
                     transitionSpec = {
@@ -615,7 +632,6 @@ fun WidgetContainer(
     }
 }
 
-// 1. МАКЕТ КАЛЕНДАРЯ: ДАТА СВЕРХУ, СЕТКА СНИЗУ
 @Composable
 fun CalendarLayoutTopView(
     date: LocalDate,
@@ -648,7 +664,6 @@ fun CalendarLayoutTopView(
     }
 }
 
-// 2. МАКЕТ КАЛЕНДАРЯ: СЕТКА СВЕРХУ, ДАТА СНИЗУ
 @Composable
 fun CalendarLayoutBottomView(
     date: LocalDate,
@@ -686,7 +701,6 @@ fun CalendarLayoutBottomView(
     }
 }
 
-// 3. МАКЕТ КАЛЕНДАРЯ: ДАТА СБОКУ, СЕТКА СПРАВА
 @Composable
 fun CalendarLayoutSplitView(
     date: LocalDate,
@@ -716,7 +730,6 @@ fun CalendarLayoutSplitView(
             horizontalAlignment = Alignment.CenterVertically,
             verticalArrangement = Arrangement.Center
         ) {
-            // Крупное число слева
             Column(
                 modifier = Modifier.weight(0.4f),
                 horizontalAlignment = Alignment.CenterHorizontally
@@ -725,7 +738,6 @@ fun CalendarLayoutSplitView(
                 Text(text = "ЧИСЛО", color = accentColor.copy(alpha = 0.7f), fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
             }
 
-            // Сетка месяца справа
             Box(modifier = Modifier.weight(0.6f)) {
                 MonthGridWidget(date, primaryColor, accentColor)
             }
