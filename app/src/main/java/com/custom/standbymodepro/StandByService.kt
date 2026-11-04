@@ -13,8 +13,12 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.hardware.TriggerEvent
+import android.hardware.TriggerEventListener
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.content.ContextCompat
@@ -24,13 +28,39 @@ class StandByService : Service(), SensorEventListener {
 
     private var sensorManager: SensorManager? = null
     private var accelerometer: Sensor? = null
+
+    // Энергоэффективные аппаратные датчики Sensor Hub (работают в Deep Sleep без WakeLock)
+    private var tiltDetectorSensor: Sensor? = null
+    private var deviceOrientationSensor: Sensor? = null
+    private var significantMotionSensor: Sensor? = null
+
     private var powerManager: PowerManager? = null
     private var keyguardManager: KeyguardManager? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var isMonitoring = false
+    private var isAccelerometerActive = false
     private var landscapeEnterTime = 0L
     private var standbyLaunchedInCurrentCycle = false
+
+    // Переводит сервис из активной проверки акселерометра в глубокий сон (Deep Sleep)
+    private val releaseActiveWindowRunnable = Runnable {
+        if (isMonitoring && hasHardwareWakeSensors()) {
+            stopActiveAccelerometerWindow()
+        }
+    }
+
+    private val sigMotionListener = object : TriggerEventListener() {
+        override fun onTrigger(event: TriggerEvent?) {
+            if (!isMonitoring || isActivityActive) return
+            // Перевооружаем триггер движения и включаем короткое окно проверки ориентации (8 сек)
+            significantMotionSensor?.let {
+                sensorManager?.requestTriggerSensor(this, it)
+            }
+            startActiveAccelerometerWindow(8_000L)
+        }
+    }
 
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -65,6 +95,15 @@ class StandByService : Service(), SensorEventListener {
         super.onCreate()
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
         accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+
+        // Ищем аппаратные wake-up датчики наклона/поворота на сопроцессоре Sensor Hub:
+        // TYPE_TILT_DETECTOR = 22, TYPE_DEVICE_ORIENTATION = 27
+        tiltDetectorSensor = sensorManager?.getDefaultSensor(22, true)
+            ?: sensorManager?.getDefaultSensor(22)
+        deviceOrientationSensor = sensorManager?.getDefaultSensor(27, true)
+            ?: sensorManager?.getDefaultSensor(27)
+        significantMotionSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
+
         powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
         keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
 
@@ -87,6 +126,10 @@ class StandByService : Service(), SensorEventListener {
         if ((powerManager?.isInteractive == false || keyguardManager?.isKeyguardLocked == true) && !isActivityActive) {
             startSensorMonitoring()
         }
+    }
+
+    private fun hasHardwareWakeSensors(): Boolean {
+        return tiltDetectorSensor != null || deviceOrientationSensor != null
     }
 
     private fun startForegroundWithNotification() {
@@ -121,30 +164,66 @@ class StandByService : Service(), SensorEventListener {
     }
 
     private fun startSensorMonitoring() {
-        if (isMonitoring || isActivityActive) return
-        isMonitoring = true
-        landscapeEnterTime = 0L
+        if (isActivityActive) return
+        if (!isMonitoring) {
+            isMonitoring = true
+            landscapeEnterTime = 0L
+
+            // Регистрируем низкопотребляющие триггеры Sensor Hub (работают без PARTIAL_WAKE_LOCK)
+            tiltDetectorSensor?.let {
+                sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+            }
+            deviceOrientationSensor?.let {
+                sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+            }
+            significantMotionSensor?.let {
+                sensorManager?.requestTriggerSensor(sigMotionListener, it)
+            }
+        }
+
+        // Включаем активное окно акселерометра на 15 секунд сразу после блокировки экрана
+        startActiveAccelerometerWindow(15_000L)
+    }
+
+    private fun startActiveAccelerometerWindow(durationMs: Long) {
+        if (!isMonitoring || isActivityActive) return
+        mainHandler.removeCallbacks(releaseActiveWindowRunnable)
 
         if (wakeLock == null) {
             wakeLock = powerManager?.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "StandByModePro::AodSensorLock"
-            )
-        }
-        if (wakeLock?.isHeld == false) {
-            wakeLock?.acquire(6 * 60 * 60 * 1000L)
+            )?.apply {
+                setReferenceCounted(false)
+            }
         }
 
-        // Редкий опрос (раз в 800 мс) + аппаратный буфер (1.6 сек) для минимального расхода АКБ
-        accelerometer?.let {
-            sensorManager?.registerListener(this, it, 800_000, 1_600_000)
+        if (hasHardwareWakeSensors()) {
+            // Держим WakeLock ровно на время короткого окна проверки (8–15 сек), после чего CPU уходит в Deep Sleep
+            wakeLock?.acquire(durationMs + 500L)
+            mainHandler.postDelayed(releaseActiveWindowRunnable, durationMs)
+        } else {
+            // Резервный режим только для редких устройств без аппаратного датчика наклона
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(2 * 60 * 60 * 1000L)
+            }
+        }
+
+        if (!isAccelerometerActive) {
+            isAccelerometerActive = true
+            accelerometer?.let {
+                sensorManager?.registerListener(this, it, 600_000, 1_200_000)
+            }
         }
     }
 
-    private fun stopSensorMonitoring() {
-        if (!isMonitoring) return
-        isMonitoring = false
-        sensorManager?.unregisterListener(this)
+    private fun stopActiveAccelerometerWindow() {
+        mainHandler.removeCallbacks(releaseActiveWindowRunnable)
+        if (isAccelerometerActive) {
+            isAccelerometerActive = false
+            accelerometer?.let { sensorManager?.unregisterListener(this, it) }
+        }
+        landscapeEnterTime = 0L
         if (wakeLock?.isHeld == true) {
             try {
                 wakeLock?.release()
@@ -152,8 +231,28 @@ class StandByService : Service(), SensorEventListener {
         }
     }
 
+    private fun stopSensorMonitoring() {
+        if (!isMonitoring) return
+        isMonitoring = false
+        stopActiveAccelerometerWindow()
+        sensorManager?.unregisterListener(this)
+        significantMotionSensor?.let {
+            try {
+                sensorManager?.cancelTriggerSensor(sigMotionListener, it)
+            } catch (_: Exception) {}
+        }
+    }
+
     override fun onSensorChanged(event: SensorEvent?) {
-        if (event?.sensor?.type != Sensor.TYPE_ACCELEROMETER) return
+        val sensorType = event?.sensor?.type ?: return
+
+        // Сработал аппаратный датчик наклона (22) или смены ориентации (27) из глубокого сна
+        if (sensorType == 22 || sensorType == 27) {
+            startActiveAccelerometerWindow(8_000L)
+            return
+        }
+
+        if (sensorType != Sensor.TYPE_ACCELEROMETER) return
 
         val x = event.values[0]
         val y = event.values[1]
@@ -167,7 +266,7 @@ class StandByService : Service(), SensorEventListener {
         if (isLandscape) {
             if (landscapeEnterTime == 0L) {
                 landscapeEnterTime = now
-            } else if (now - landscapeEnterTime > 700L && !standbyLaunchedInCurrentCycle) {
+            } else if (now - landscapeEnterTime > 600L && !standbyLaunchedInCurrentCycle) {
                 if (Settings.canDrawOverlays(this)) {
                     standbyLaunchedInCurrentCycle = true
                     stopSensorMonitoring()
