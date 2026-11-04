@@ -44,14 +44,13 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.graphicsLayer
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -330,17 +329,16 @@ fun StandByScreen(
         mutableIntStateOf(prefs.getInt("theme_index", 0).coerceIn(0, colorThemes.lastIndex))
     }
     var showControls by remember { mutableStateOf(false) }
-    var showFps by remember { mutableStateOf(false) } // Переключатель счетчика FPS
+    var showFps by remember { mutableStateOf(false) }
 
-    // Флаг активной анимации/обновления для переключения герцовки экрана (1 Гц статично / 30 Гц в движении)
+    // Флаг активной анимации для переключения герцовки (1 Гц / 30 Гц)
     var isAnimating by remember { mutableStateOf(false) }
 
-    // Управление аппаратной частотой обновления дисплея
+    // Управление частотой обновления дисплея
     LaunchedEffect(isAnimating) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             (context as? Activity)?.window?.let { window ->
                 val params = window.attributes
-                // 30 Гц во время анимации смены минут/циферблатов, 1 Гц (или минимум) в статике для экономии 93% батареи
                 params.preferredRefreshRate = if (isAnimating) 30f else 1f
                 window.attributes = params
             }
@@ -400,7 +398,7 @@ fun StandByScreen(
         label = "accentColor"
     )
 
-    // Цикл смены минут: включает 30 Гц на 2.5 секунды во время анимации, затем сбрасывает в 1 Гц
+    // Цикл смены минут: 30 Гц на 2.5 сек, потом обратно в 1 Гц
     LaunchedEffect(autoCycleOled) {
         var lastMinute = -1
         var minutesCounter = 0
@@ -410,8 +408,8 @@ fun StandByScreen(
             if (now.minute != lastMinute) {
                 val isFirstTick = lastMinute == -1
                 lastMinute = now.minute
-                
-                isAnimating = true // Поднимаем герцовку до 30 Гц на время отрисовки анимации
+
+                isAnimating = true
                 currentTime = now
                 currentDate = LocalDate.now()
 
@@ -445,8 +443,8 @@ fun StandByScreen(
                             status == BatteryManager.BATTERY_STATUS_FULL
                 } catch (_: Exception) {}
 
-                delay(2500L) // Даем завершиться 2-секундной анимации crossfade
-                isAnimating = false // Возвращаем дисплей в режим 1 Гц (глубокий энергосберегающий покой)
+                delay(2500L)
+                isAnimating = false
             }
             delay(1000L)
         }
@@ -469,7 +467,6 @@ fun StandByScreen(
             ) { showControls = !showControls }
             .padding(24.dp)
     ) {
-        // Главный контейнер с аппаратным кэшированием слоев (GPU Cache), чтобы в покое не тратить энергию
         Row(
             modifier = Modifier
                 .fillMaxSize()
@@ -505,7 +502,6 @@ fun StandByScreen(
             )
         }
 
-        // Счетчик FPS в правом верхнем углу (если включен в меню)
         if (showFps) {
             FpsMeter(
                 modifier = Modifier
@@ -514,7 +510,6 @@ fun StandByScreen(
             )
         }
 
-        // Верхняя панель управления
         if (showControls) {
             Row(
                 modifier = Modifier
@@ -594,11 +589,18 @@ fun StandByScreen(
                     Text("Виджет: ${rightWidget.title}", color = Color.White, fontSize = 12.sp)
                 }
 
-                // Кнопка включения/выключения счетчика FPS
                 TextButton(onClick = { showFps = !showFps }) {
-                    Icon(Icons.Default.Speed, contentDescription = null, tint = if (showFps) Color(0xFF32D74B) else Color.Gray)
+                    Icon(
+                        Icons.Default.Speed,
+                        contentDescription = null,
+                        tint = if (showFps) Color(0xFF32D74B) else Color.Gray
+                    )
                     Spacer(Modifier.width(4.dp))
-                    Text(if (showFps) "FPS: ВКЛ" else "FPS: ВЫКЛ", color = if (showFps) Color(0xFF32D74B) else Color.LightGray, fontSize = 12.sp)
+                    Text(
+                        if (showFps) "FPS: ВКЛ" else "FPS: ВЫКЛ",
+                        color = if (showFps) Color(0xFF32D74B) else Color.LightGray,
+                        fontSize = 12.sp
+                    )
                 }
 
                 if (!Settings.canDrawOverlays(context)) {
@@ -613,7 +615,6 @@ fun StandByScreen(
     }
 }
 
-// Надежный компонент подсчета реального FPS через Choreographer
 @Composable
 fun FpsMeter(modifier: Modifier = Modifier) {
     var fps by remember { mutableIntStateOf(0) }
@@ -902,8 +903,19 @@ fun FlipCard(text: String, primaryColor: Color, accentColor: Color, modifier: Mo
             .border(1.5.dp, primaryColor.copy(alpha = 0.22f), RoundedCornerShape(28.dp)),
         contentAlignment = Alignment.Center
     ) {
-        Text(text = text, color = primaryColor, fontSize = 114.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-        Box(modifier = Modifier.fillMaxWidth().height(3.dp).background(Color(0xFF000000)))
+        Text(
+            text = text,
+            color = primaryColor,
+            fontSize = 114.sp,
+            fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(3.dp)
+                .background(Color(0xFF000000))
+        )
     }
 }
 
@@ -912,9 +924,24 @@ fun DigitalDuoClockView(time: LocalTime, primaryColor: Color, accentColor: Color
     val hourStr = String.format("%02d", time.hour)
     val minStr = String.format("%02d", time.minute)
 
-    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-        Text(text = "$hourStr:$minStr", color = primaryColor, fontSize = 124.sp, fontWeight = FontWeight.Bold, letterSpacing = (-3).sp)
-        Text(text = "STANDBY РЕЖИМ", color = accentColor, fontSize = 14.sp, fontWeight = FontWeight.Medium, letterSpacing = 3.sp)
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "$hourStr:$minStr",
+            color = primaryColor,
+            fontSize = 124.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = (-3).sp
+        )
+        Text(
+            text = "STANDBY РЕЖИМ",
+            color = accentColor,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 3.sp
+        )
     }
 }
 
@@ -923,15 +950,48 @@ fun StackedThinClockView(time: LocalTime, primaryColor: Color, accentColor: Colo
     val hourStr = String.format("%02d", time.hour)
     val minStr = String.format("%02d", time.minute)
 
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-        Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.Center) {
-            Text(text = hourStr, color = primaryColor, fontSize = 104.sp, fontWeight = FontWeight.Light, lineHeight = 96.sp)
-            Text(text = minStr, color = accentColor, fontSize = 104.sp, fontWeight = FontWeight.Light, lineHeight = 96.sp)
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(20.dp)
+    ) {
+        Column(
+            horizontalAlignment = Alignment.End,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = hourStr,
+                color = primaryColor,
+                fontSize = 104.sp,
+                fontWeight = FontWeight.Light,
+                lineHeight = 96.sp
+            )
+            Text(
+                text = minStr,
+                color = accentColor,
+                fontSize = 104.sp,
+                fontWeight = FontWeight.Light,
+                lineHeight = 96.sp
+            )
         }
-        Column(verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.Start) {
-            Text(text = "ЧАС", color = primaryColor.copy(alpha = 0.4f), fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+        Column(
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.Start
+        ) {
+            Text(
+                text = "ЧАС",
+                color = primaryColor.copy(alpha = 0.4f),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 2.sp
+            )
             Spacer(modifier = Modifier.height(72.dp))
-            Text(text = "МИН", color = accentColor.copy(alpha = 0.6f), fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+            Text(
+                text = "МИН",
+                color = accentColor.copy(alpha = 0.6f),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 2.sp
+            )
         }
     }
 }
@@ -941,22 +1001,58 @@ fun TerminalClockView(time: LocalTime, primaryColor: Color, accentColor: Color) 
     val hourStr = String.format("%02d", time.hour)
     val minStr = String.format("%02d", time.minute)
 
-    Column(modifier = Modifier.fillMaxWidth(0.95f).padding(vertical = 24.dp, horizontal = 16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-        Text(text = "[ DIGITAL STANDBY ]", color = accentColor.copy(alpha = 0.8f), fontSize = 13.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium, letterSpacing = 2.sp)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth(0.95f)
+            .padding(vertical = 24.dp, horizontal = 16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "[ DIGITAL STANDBY ]",
+            color = accentColor.copy(alpha = 0.8f),
+            fontSize = 13.sp,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 2.sp
+        )
         Spacer(modifier = Modifier.height(10.dp))
-        Text(text = "$hourStr:$minStr", color = primaryColor, fontSize = 96.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Light)
+        Text(
+            text = "$hourStr:$minStr",
+            color = primaryColor,
+            fontSize = 96.sp,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Light
+        )
     }
 }
 
 @Composable
-fun BatteryBadge(batteryPct: Int, isCharging: Boolean, primaryColor: Color, accentColor: Color) {
+fun BatteryBadge(
+    batteryPct: Int,
+    isCharging: Boolean,
+    primaryColor: Color,
+    accentColor: Color
+) {
     Row(
-        modifier = Modifier.border(1.dp, primaryColor.copy(alpha = 0.28f), RoundedCornerShape(50)).padding(horizontal = 10.dp, vertical = 5.dp),
+        modifier = Modifier
+            .border(1.dp, primaryColor.copy(alpha = 0.28f), RoundedCornerShape(50))
+            .padding(horizontal = 10.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp)
     ) {
-        Icon(imageVector = if (isCharging) Icons.Default.Bolt else Icons.Default.BatteryStd, contentDescription = null, tint = if (isCharging) accentColor else primaryColor, modifier = Modifier.size(16.dp))
-        Text(text = "$batteryPct%", color = primaryColor, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+        Icon(
+            imageVector = if (isCharging) Icons.Default.Bolt else Icons.Default.BatteryStd,
+            contentDescription = null,
+            tint = if (isCharging) accentColor else primaryColor,
+            modifier = Modifier.size(16.dp)
+        )
+        Text(
+            text = "$batteryPct%",
+            color = primaryColor,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold
+        )
     }
 }
 
@@ -976,14 +1072,36 @@ fun TimerWidgetView(primaryColor: Color, accentColor: Color) {
     val mins = remainingSeconds / 60
     val secs = remainingSeconds % 60
 
-    Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceEvenly) {
-        Text(text = "ФОКУС-ТАЙМЕР", color = accentColor, fontSize = 16.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
-        Text(text = String.format("%02d:%02d", mins, secs), color = primaryColor, fontSize = 60.sp, fontWeight = FontWeight.Light)
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.SpaceEvenly
+    ) {
+        Text(
+            text = "ФОКУС-ТАЙМЕР",
+            color = accentColor,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 2.sp
+        )
+        Text(
+            text = String.format("%02d:%02d", mins, secs),
+            color = primaryColor,
+            fontSize = 60.sp,
+            fontWeight = FontWeight.Light
+        )
         Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             OutlinedButton(onClick = { isRunning = !isRunning }) {
-                Text(if (isRunning) "Пауза" else "Старт", color = accentColor, fontWeight = FontWeight.Bold)
+                Text(
+                    if (isRunning) "Пауза" else "Старт",
+                    color = accentColor,
+                    fontWeight = FontWeight.Bold
+                )
             }
-            OutlinedButton(onClick = { isRunning = false; remainingSeconds = 25 * 60 }) {
+            OutlinedButton(onClick = {
+                isRunning = false
+                remainingSeconds = 25 * 60
+            }) {
                 Text("Сброс", color = primaryColor)
             }
         }
@@ -991,11 +1109,42 @@ fun TimerWidgetView(primaryColor: Color, accentColor: Color) {
 }
 
 @Composable
-fun BatteryWidgetView(batteryPct: Int, isCharging: Boolean, ambientLux: Float, targetBrightnessPct: Int, primaryColor: Color, accentColor: Color) {
-    Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceEvenly) {
-        Icon(imageVector = if (isCharging) Icons.Default.BatteryChargingFull else Icons.Default.BatteryStd, contentDescription = null, tint = accentColor, modifier = Modifier.size(52.dp))
-        Text(text = "$batteryPct%", color = primaryColor, fontSize = 58.sp, fontWeight = FontWeight.Light)
-        Text(text = if (isCharging) "ИДЕТ ЗАРЯДКА • STANDBY" else "РАБОТА ОТ БАТАРЕИ", color = primaryColor.copy(alpha = 0.7f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
-        Text(text = "Свет: ${ambientLux.toInt()} лк • Яркость: $targetBrightnessPct%", color = primaryColor.copy(alpha = 0.5f), fontSize = 12.sp)
+fun BatteryWidgetView(
+    batteryPct: Int,
+    isCharging: Boolean,
+    ambientLux: Float,
+    targetBrightnessPct: Int,
+    primaryColor: Color,
+    accentColor: Color
+) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.SpaceEvenly
+    ) {
+        Icon(
+            imageVector = if (isCharging) Icons.Default.BatteryChargingFull else Icons.Default.BatteryStd,
+            contentDescription = null,
+            tint = accentColor,
+            modifier = Modifier.size(52.dp)
+        )
+        Text(
+            text = "$batteryPct%",
+            color = primaryColor,
+            fontSize = 58.sp,
+            fontWeight = FontWeight.Light
+        )
+        Text(
+            text = if (isCharging) "ИДЕТ ЗАРЯДКА • STANDBY" else "РАБОТА ОТ БАТАРЕИ",
+            color = primaryColor.copy(alpha = 0.7f),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            textAlign = TextAlign.Center
+        )
+        Text(
+            text = "Свет: ${ambientLux.toInt()} лк • Яркость: $targetBrightnessPct%",
+            color = primaryColor.copy(alpha = 0.5f),
+            fontSize = 12.sp
+        )
     }
 }
