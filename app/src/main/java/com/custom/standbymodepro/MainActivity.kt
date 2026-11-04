@@ -45,6 +45,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -52,12 +53,17 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.YearMonth
 import java.time.format.TextStyle
 import java.util.Locale
+import kotlin.coroutines.resume
 import kotlin.math.abs
 import kotlin.random.Random
 
@@ -69,7 +75,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var currentLux by mutableFloatStateOf(100f)
 
     private var portraitEnterTime = 0L
-    private var lastAccelProcessTime = 0L
 
     private val closeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -119,6 +124,35 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         } catch (_: Exception) {}
 
         setContent {
+            // Импульсный опрос датчика освещения 1 раз в 10 секунд
+            LaunchedEffect(Unit) {
+                val sm = sensorManager
+                val ls = lightSensor
+                if (sm != null && ls != null) {
+                    while (true) {
+                        val sampledLux = withTimeoutOrNull(1500L) {
+                            suspendCancellableCoroutine<Float> { cont ->
+                                val listener = object : SensorEventListener {
+                                    override fun onSensorChanged(event: SensorEvent?) {
+                                        if (event != null && event.values.isNotEmpty()) {
+                                            sm.unregisterListener(this)
+                                            if (cont.isActive) cont.resume(event.values[0])
+                                        }
+                                    }
+                                    override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+                                }
+                                sm.registerListener(listener, ls, SensorManager.SENSOR_DELAY_NORMAL)
+                                cont.invokeOnCancellation { sm.unregisterListener(listener) }
+                            }
+                        }
+                        if (sampledLux != null && abs(sampledLux - currentLux) >= 1f) {
+                            currentLux = sampledLux
+                        }
+                        delay(10_000L)
+                    }
+                }
+            }
+
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -128,7 +162,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     ambientLux = currentLux,
                     onRequestOverlayPermission = {
                         try {
-                            // Важно: this@MainActivity, а не просто this (иначе BoxScope)
                             if (!Settings.canDrawOverlays(this@MainActivity)) {
                                 val intent = Intent(
                                     Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -172,19 +205,20 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onResume() {
         super.onResume()
         portraitEnterTime = 0L
-        lastAccelProcessTime = 0L
+        StandByService.isActivityActive = true
+        sendBroadcast(Intent(StandByService.ACTION_ACTIVITY_RESUMED).setPackage(packageName))
         window.decorView.post { hideSystemUI() }
-        lightSensor?.let {
-            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
-        }
+
         accelerometer?.let {
-            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+            sensorManager?.registerListener(this, it, 500_000, 1_000_000)
         }
     }
 
     override fun onPause() {
         super.onPause()
         sensorManager?.unregisterListener(this)
+        StandByService.isActivityActive = false
+        sendBroadcast(Intent(StandByService.ACTION_ACTIVITY_PAUSED).setPackage(packageName))
     }
 
     override fun onDestroy() {
@@ -196,29 +230,21 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
-        when (event?.sensor?.type) {
-            Sensor.TYPE_LIGHT -> {
-                currentLux = event.values[0]
-            }
-            Sensor.TYPE_ACCELEROMETER -> {
-                val now = System.currentTimeMillis()
-                if (now - lastAccelProcessTime < 400L) return
-                lastAccelProcessTime = now
+        if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
+            val x = event.values[0]
+            val y = event.values[1]
 
-                val x = event.values[0]
-                val y = event.values[1]
+            val isPortrait = abs(y) > 6.5f && abs(x) < 4.5f
+            val now = System.currentTimeMillis()
 
-                val isPortrait = abs(y) > 6.5f && abs(x) < 4.5f
-
-                if (isPortrait) {
-                    if (portraitEnterTime == 0L) {
-                        portraitEnterTime = now
-                    } else if (now - portraitEnterTime > 800L) {
-                        finish()
-                    }
-                } else {
-                    portraitEnterTime = 0L
+            if (isPortrait) {
+                if (portraitEnterTime == 0L) {
+                    portraitEnterTime = now
+                } else if (now - portraitEnterTime > 500L) {
+                    finish()
                 }
+            } else {
+                portraitEnterTime = 0L
             }
         }
     }
@@ -235,8 +261,7 @@ enum class DigitalClockStyle(val title: String) {
 
 enum class CalendarLayoutStyle(val title: String) {
     LAYOUT_TOP("Дата сверху"),
-    LAYOUT_BOTTOM("Дата снизу"),
-    LAYOUT_SPLIT("Дата сбоку")
+    LAYOUT_BOTTOM("Дата снизу")
 }
 
 enum class RightWidget(val title: String) {
@@ -266,23 +291,62 @@ val colorThemes = listOf(
     ColorTheme("Коралл", Color(0xFFFF453A), Color(0xFFFF9F0A))
 )
 
+private const val PREFS_NAME = "standby_mode_prefs"
+
 @Composable
 fun StandByScreen(
     ambientLux: Float,
     onRequestOverlayPermission: () -> Unit
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
+
     var currentTime by remember { mutableStateOf(LocalTime.now()) }
     var currentDate by remember { mutableStateOf(LocalDate.now()) }
 
-    var clockStyle by remember { mutableStateOf(DigitalClockStyle.FLIP) }
-    var calendarStyle by remember { mutableStateOf(CalendarLayoutStyle.LAYOUT_TOP) }
-    var swapPanels by remember { mutableStateOf(false) }
-    var autoCycleOled by remember { mutableStateOf(true) }
-    var rightWidget by remember { mutableStateOf(RightWidget.CALENDAR) }
-    var brightnessMode by remember { mutableStateOf(BrightnessMode.AUTO) }
-    var themeIndex by remember { mutableIntStateOf(0) }
-    var showControls by remember { mutableStateOf(true) }
+    var clockStyle by remember {
+        val saved = prefs.getInt("clock_style", 0).coerceIn(0, DigitalClockStyle.entries.lastIndex)
+        mutableStateOf(DigitalClockStyle.entries[saved])
+    }
+    var calendarStyle by remember {
+        val saved = prefs.getInt("calendar_style", 0).coerceIn(0, CalendarLayoutStyle.entries.lastIndex)
+        mutableStateOf(CalendarLayoutStyle.entries[saved])
+    }
+    var autoCycleOled by remember {
+        mutableStateOf(prefs.getBoolean("auto_cycle_oled", true))
+    }
+    var rightWidget by remember {
+        val saved = prefs.getInt("right_widget", 0).coerceIn(0, RightWidget.entries.lastIndex)
+        mutableStateOf(RightWidget.entries[saved])
+    }
+    var brightnessMode by remember {
+        val saved = prefs.getInt("brightness_mode", 0).coerceIn(0, BrightnessMode.entries.lastIndex)
+        mutableStateOf(BrightnessMode.entries[saved])
+    }
+    var themeIndex by remember {
+        mutableIntStateOf(prefs.getInt("theme_index", 0).coerceIn(0, colorThemes.lastIndex))
+    }
+    var showControls by remember { mutableStateOf(false) }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE) {
+                prefs.edit()
+                    .putInt("clock_style", clockStyle.ordinal)
+                    .putInt("calendar_style", calendarStyle.ordinal)
+                    .putBoolean("auto_cycle_oled", autoCycleOled)
+                    .putInt("right_widget", rightWidget.ordinal)
+                    .putInt("brightness_mode", brightnessMode.ordinal)
+                    .putInt("theme_index", themeIndex)
+                    .apply()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     var burnInOffsetX by remember { mutableIntStateOf(0) }
     var burnInOffsetY by remember { mutableIntStateOf(0) }
@@ -317,45 +381,34 @@ fun StandByScreen(
         label = "accentColor"
     )
 
+    // Обновление ровно по смене минут (без секунд), сдвиг пикселей каждые 3 мин, ротация раз в 5 мин
     LaunchedEffect(autoCycleOled) {
         var lastMinute = -1
         var minutesCounter = 0
-
-        try {
-            val bm = context.registerReceiver(null, IntentFilter(ACTION_BATTERY_CHANGED))
-            val level = bm?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-            val scale = bm?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-            val status = bm?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
-            if (level >= 0 && scale > 0) {
-                batteryPct = (level * 100) / scale
-            }
-            isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
-                    status == BatteryManager.BATTERY_STATUS_FULL
-        } catch (_: Exception) {}
-
         while (true) {
             val now = LocalTime.now()
-            currentTime = now
-            currentDate = LocalDate.now()
 
             if (now.minute != lastMinute) {
+                val isFirstTick = lastMinute == -1
                 lastMinute = now.minute
-                minutesCounter++
+                currentTime = now
+                currentDate = LocalDate.now()
 
-                burnInOffsetX = Random.nextInt(-12, 13)
-                burnInOffsetY = Random.nextInt(-10, 11)
+                if (!isFirstTick) {
+                    minutesCounter++
 
-                if (autoCycleOled && minutesCounter > 1) {
-                    if (minutesCounter % 4 == 0) {
-                        clockStyle = DigitalClockStyle.entries[
-                            (clockStyle.ordinal + 1) % DigitalClockStyle.entries.size
-                        ]
+                    if (minutesCounter % 3 == 0) {
+                        burnInOffsetX = Random.nextInt(-18, 19)
+                        burnInOffsetY = Random.nextInt(-14, 15)
+                    }
+
+                    if (autoCycleOled && minutesCounter % 5 == 0) {
+                        val otherClocks = DigitalClockStyle.entries.filter { it != clockStyle }
+                        clockStyle = otherClocks.random()
+
                         calendarStyle = CalendarLayoutStyle.entries[
                             (calendarStyle.ordinal + 1) % CalendarLayoutStyle.entries.size
                         ]
-                    }
-                    if (minutesCounter % 8 == 0) {
-                        swapPanels = !swapPanels
                     }
                 }
 
@@ -371,7 +424,7 @@ fun StandByScreen(
                             status == BatteryManager.BATTERY_STATUS_FULL
                 } catch (_: Exception) {}
             }
-            delay(1000L)
+            delay(1000L) // Проверяем системное время каждую секунду, но перерисовываем и сдвигаем только когда меняется минута
         }
     }
 
@@ -392,63 +445,36 @@ fun StandByScreen(
             ) { showControls = !showControls }
             .padding(24.dp)
     ) {
-        AnimatedContent(
-            targetState = swapPanels,
-            transitionSpec = {
-                fadeIn(animationSpec = tween(2000)) togetherWith
-                        fadeOut(animationSpec = tween(2000))
-            },
-            label = "SwapPanelsCrossfade"
-        ) { isSwapped ->
-            Row(
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .offset { IntOffset(burnInOffsetX, burnInOffsetY) },
+            horizontalArrangement = Arrangement.spacedBy(24.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ClockContainer(
+                clockStyle = clockStyle,
+                currentTime = currentTime,
+                primaryColor = primaryColor,
+                accentColor = accentColor,
                 modifier = Modifier
-                    .fillMaxSize()
-                    .offset { IntOffset(burnInOffsetX, burnInOffsetY) },
-                horizontalArrangement = Arrangement.spacedBy(24.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                if (!isSwapped) {
-                    ClockContainer(
-                        clockStyle = clockStyle,
-                        currentTime = currentTime,
-                        primaryColor = primaryColor,
-                        accentColor = accentColor,
-                        modifier = Modifier.weight(1.1f).fillMaxHeight()
-                    )
-                    WidgetContainer(
-                        rightWidget = rightWidget,
-                        calendarStyle = calendarStyle,
-                        currentDate = currentDate,
-                        batteryPct = batteryPct,
-                        isCharging = isCharging,
-                        ambientLux = ambientLux,
-                        targetBrightnessPct = (targetBrightness * 100).toInt(),
-                        primaryColor = primaryColor,
-                        accentColor = accentColor,
-                        modifier = Modifier.weight(0.9f).fillMaxHeight()
-                    )
-                } else {
-                    WidgetContainer(
-                        rightWidget = rightWidget,
-                        calendarStyle = calendarStyle,
-                        currentDate = currentDate,
-                        batteryPct = batteryPct,
-                        isCharging = isCharging,
-                        ambientLux = ambientLux,
-                        targetBrightnessPct = (targetBrightness * 100).toInt(),
-                        primaryColor = primaryColor,
-                        accentColor = accentColor,
-                        modifier = Modifier.weight(0.9f).fillMaxHeight()
-                    )
-                    ClockContainer(
-                        clockStyle = clockStyle,
-                        currentTime = currentTime,
-                        primaryColor = primaryColor,
-                        accentColor = accentColor,
-                        modifier = Modifier.weight(1.1f).fillMaxHeight()
-                    )
-                }
-            }
+                    .weight(1.1f)
+                    .fillMaxHeight()
+            )
+            WidgetContainer(
+                rightWidget = rightWidget,
+                calendarStyle = calendarStyle,
+                currentDate = currentDate,
+                batteryPct = batteryPct,
+                isCharging = isCharging,
+                ambientLux = ambientLux,
+                targetBrightnessPct = (targetBrightness * 100).toInt(),
+                primaryColor = primaryColor,
+                accentColor = accentColor,
+                modifier = Modifier
+                    .weight(0.9f)
+                    .fillMaxHeight()
+            )
         }
 
         if (showControls) {
@@ -480,12 +506,6 @@ fun StandByScreen(
                     Icon(Icons.Default.CalendarMonth, contentDescription = null, tint = Color.White)
                     Spacer(Modifier.width(5.dp))
                     Text("Календарь: ${calendarStyle.title}", color = Color.White, fontSize = 12.sp)
-                }
-
-                TextButton(onClick = { swapPanels = !swapPanels }) {
-                    Icon(Icons.Default.SwapHoriz, contentDescription = null, tint = Color.White)
-                    Spacer(Modifier.width(4.dp))
-                    Text("Стороны", color = Color.White, fontSize = 12.sp)
                 }
 
                 TextButton(onClick = { autoCycleOled = !autoCycleOled }) {
@@ -607,20 +627,30 @@ fun WidgetContainer(
                 ) { style ->
                     when (style) {
                         CalendarLayoutStyle.LAYOUT_TOP -> CalendarLayoutTopView(
-                            date = currentDate, batteryPct = batteryPct, isCharging = isCharging, primaryColor = primaryColor, accentColor = accentColor
+                            date = currentDate,
+                            batteryPct = batteryPct,
+                            isCharging = isCharging,
+                            primaryColor = primaryColor,
+                            accentColor = accentColor
                         )
                         CalendarLayoutStyle.LAYOUT_BOTTOM -> CalendarLayoutBottomView(
-                            date = currentDate, batteryPct = batteryPct, isCharging = isCharging, primaryColor = primaryColor, accentColor = accentColor
-                        )
-                        CalendarLayoutStyle.LAYOUT_SPLIT -> CalendarLayoutSplitView(
-                            date = currentDate, batteryPct = batteryPct, isCharging = isCharging, primaryColor = primaryColor, accentColor = accentColor
+                            date = currentDate,
+                            batteryPct = batteryPct,
+                            isCharging = isCharging,
+                            primaryColor = primaryColor,
+                            accentColor = accentColor
                         )
                     }
                 }
             }
             RightWidget.POMODORO_TIMER -> TimerWidgetView(primaryColor = primaryColor, accentColor = accentColor)
             RightWidget.BATTERY_INFO -> BatteryWidgetView(
-                batteryPct = batteryPct, isCharging = isCharging, ambientLux = ambientLux, targetBrightnessPct = targetBrightnessPct, primaryColor = primaryColor, accentColor = accentColor
+                batteryPct = batteryPct,
+                isCharging = isCharging,
+                ambientLux = ambientLux,
+                targetBrightnessPct = targetBrightnessPct,
+                primaryColor = primaryColor,
+                accentColor = accentColor
             )
         }
     }
@@ -696,51 +726,6 @@ fun CalendarLayoutBottomView(
 }
 
 @Composable
-fun CalendarLayoutSplitView(
-    date: LocalDate,
-    batteryPct: Int,
-    isCharging: Boolean,
-    primaryColor: Color,
-    accentColor: Color
-) {
-    val ruLocale = Locale("ru", "RU")
-    val monthName = date.month.getDisplayName(TextStyle.FULL_STANDALONE, ruLocale).uppercase(ruLocale)
-
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.SpaceBetween
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(text = "$monthName • ВСЯ СЕТКА", color = accentColor, fontSize = 14.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
-            BatteryBadge(batteryPct, isCharging, primaryColor, accentColor)
-        }
-
-        // Исправлено: правильные параметры Row
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.Center,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(
-                modifier = Modifier.weight(0.4f),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text(text = date.dayOfMonth.toString(), color = primaryColor, fontSize = 56.sp, fontWeight = FontWeight.Thin)
-                Text(text = "ЧИСЛО", color = accentColor.copy(alpha = 0.7f), fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
-            }
-
-            Box(modifier = Modifier.weight(0.6f)) {
-                MonthGridWidget(date, primaryColor, accentColor)
-            }
-        }
-    }
-}
-
-@Composable
 fun MonthGridWidget(
     date: LocalDate,
     primaryColor: Color,
@@ -805,20 +790,19 @@ fun MonthGridWidget(
 fun FlipClockView(time: LocalTime, primaryColor: Color, accentColor: Color) {
     val hourStr = String.format("%02d", time.hour)
     val minStr = String.format("%02d", time.minute)
-    val secStr = String.format("%02d", time.second)
 
     Row(
         modifier = Modifier.fillMaxSize(),
         horizontalArrangement = Arrangement.spacedBy(16.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        FlipCard(hourStr, "", primaryColor, accentColor, Modifier.weight(1f).fillMaxHeight(0.82f))
-        FlipCard(minStr, secStr, primaryColor, accentColor, Modifier.weight(1f).fillMaxHeight(0.82f))
+        FlipCard(hourStr, primaryColor, accentColor, Modifier.weight(1f).fillMaxHeight(0.82f))
+        FlipCard(minStr, primaryColor, accentColor, Modifier.weight(1f).fillMaxHeight(0.82f))
     }
 }
 
 @Composable
-fun FlipCard(text: String, subtitle: String, primaryColor: Color, accentColor: Color, modifier: Modifier = Modifier) {
+fun FlipCard(text: String, primaryColor: Color, accentColor: Color, modifier: Modifier = Modifier) {
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(28.dp))
@@ -826,11 +810,8 @@ fun FlipCard(text: String, subtitle: String, primaryColor: Color, accentColor: C
             .border(1.5.dp, primaryColor.copy(alpha = 0.22f), RoundedCornerShape(28.dp)),
         contentAlignment = Alignment.Center
     ) {
-        Text(text = text, color = primaryColor, fontSize = 108.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Text(text = text, color = primaryColor, fontSize = 114.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
         Box(modifier = Modifier.fillMaxWidth().height(3.dp).background(Color(0xFF000000)))
-        if (subtitle.isNotEmpty()) {
-            Text(text = subtitle, color = accentColor.copy(alpha = 0.8f), fontSize = 19.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.align(Alignment.BottomEnd).padding(18.dp))
-        }
     }
 }
 
@@ -840,8 +821,8 @@ fun DigitalDuoClockView(time: LocalTime, primaryColor: Color, accentColor: Color
     val minStr = String.format("%02d", time.minute)
 
     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-        Text(text = "$hourStr:$minStr", color = primaryColor, fontSize = 114.sp, fontWeight = FontWeight.Bold, letterSpacing = (-3).sp)
-        Text(text = String.format("СЕКУНДЫ • %02d", time.second), color = accentColor, fontSize = 17.sp, fontWeight = FontWeight.Medium, letterSpacing = 3.sp)
+        Text(text = "$hourStr:$minStr", color = primaryColor, fontSize = 124.sp, fontWeight = FontWeight.Bold, letterSpacing = (-3).sp)
+        Text(text = "STANDBY РЕЖИМ", color = accentColor, fontSize = 14.sp, fontWeight = FontWeight.Medium, letterSpacing = 3.sp)
     }
 }
 
@@ -849,19 +830,16 @@ fun DigitalDuoClockView(time: LocalTime, primaryColor: Color, accentColor: Color
 fun StackedThinClockView(time: LocalTime, primaryColor: Color, accentColor: Color) {
     val hourStr = String.format("%02d", time.hour)
     val minStr = String.format("%02d", time.minute)
-    val secStr = String.format("%02d", time.second)
 
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(20.dp)) {
         Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.Center) {
-            Text(text = hourStr, color = primaryColor, fontSize = 96.sp, fontWeight = FontWeight.Light, lineHeight = 90.sp)
-            Text(text = minStr, color = accentColor, fontSize = 96.sp, fontWeight = FontWeight.Light, lineHeight = 90.sp)
+            Text(text = hourStr, color = primaryColor, fontSize = 104.sp, fontWeight = FontWeight.Light, lineHeight = 96.sp)
+            Text(text = minStr, color = accentColor, fontSize = 104.sp, fontWeight = FontWeight.Light, lineHeight = 96.sp)
         }
         Column(verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.Start) {
             Text(text = "ЧАС", color = primaryColor.copy(alpha = 0.4f), fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
-            Spacer(modifier = Modifier.height(64.dp))
+            Spacer(modifier = Modifier.height(72.dp))
             Text(text = "МИН", color = accentColor.copy(alpha = 0.6f), fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
-            Spacer(modifier = Modifier.height(12.dp))
-            Text(text = ":$secStr", color = primaryColor.copy(alpha = 0.7f), fontSize = 26.sp, fontWeight = FontWeight.Light, fontFamily = FontFamily.Monospace)
         }
     }
 }
@@ -870,15 +848,11 @@ fun StackedThinClockView(time: LocalTime, primaryColor: Color, accentColor: Colo
 fun TerminalClockView(time: LocalTime, primaryColor: Color, accentColor: Color) {
     val hourStr = String.format("%02d", time.hour)
     val minStr = String.format("%02d", time.minute)
-    val secStr = String.format("%02d", time.second)
 
     Column(modifier = Modifier.fillMaxWidth(0.95f).padding(vertical = 24.dp, horizontal = 16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Text(text = "[ DIGITAL STANDBY ]", color = accentColor.copy(alpha = 0.8f), fontSize = 13.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium, letterSpacing = 2.sp)
         Spacer(modifier = Modifier.height(10.dp))
-        Row(verticalAlignment = Alignment.Bottom) {
-            Text(text = "$hourStr:$minStr", color = primaryColor, fontSize = 86.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Light)
-            Text(text = ":$secStr", color = accentColor, fontSize = 34.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Normal, modifier = Modifier.padding(bottom = 12.dp, start = 4.dp))
-        }
+        Text(text = "$hourStr:$minStr", color = primaryColor, fontSize = 96.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Light)
     }
 }
 
