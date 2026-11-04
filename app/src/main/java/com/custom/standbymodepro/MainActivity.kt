@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.Intent.ACTION_BATTERY_CHANGED
+import android.graphics.drawable.ColorDrawable
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -23,9 +24,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -44,6 +49,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -53,12 +59,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
-import java.time.DayOfWeek
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.YearMonth
 import java.time.format.TextStyle
-import java.time.temporal.TemporalAdjusters
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.random.Random
@@ -70,16 +74,38 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var accelerometer: Sensor? = null
     private var currentLux by mutableFloatStateOf(100f)
 
+    // Триггер для плавного 2-секундного проявления при каждом выходе из AOD
+    private var launchCounter by mutableIntStateOf(0)
     private var portraitEnterTime = 0L
 
     private val closeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             finish()
+            overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Убираем стандартную резкую системную анимацию открытия окна
+        overridePendingTransition(0, 0)
+
+        // ГАРАНТИЯ 100% TRUE BLACK OLED (#000000) НА УРОВНЕ ОКНА ANDROID:
+        // Отключаем серую подложку темы, размытие фона и системный dim-эффект
+        try {
+            window.setBackgroundDrawable(ColorDrawable(android.graphics.Color.BLACK))
+            window.decorView.setBackgroundColor(android.graphics.Color.BLACK)
+            window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            window.statusBarColor = android.graphics.Color.BLACK
+            window.navigationBarColor = android.graphics.Color.BLACK
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                window.isNavigationBarContrastEnforced = false
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                window.attributes.blurBehindRadius = 0
+            }
+        } catch (_: Exception) {}
 
         try {
             val serviceIntent = Intent(this, StandByService::class.java)
@@ -120,6 +146,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         setContent {
             StandByScreen(
                 ambientLux = currentLux,
+                launchTrigger = launchCounter,
                 onRequestOverlayPermission = {
                     try {
                         if (!Settings.canDrawOverlays(this)) {
@@ -161,9 +188,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         } catch (_: Exception) {}
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        launchCounter++
+    }
+
     override fun onResume() {
         super.onResume()
         portraitEnterTime = 0L
+        launchCounter++ // Запускает плавное 2.2-секундное проявление из темноты AOD
         window.decorView.post { hideSystemUI() }
         lightSensor?.let {
             sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
@@ -202,6 +235,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                         portraitEnterTime = now
                     } else if (now - portraitEnterTime > 600L) {
                         finish()
+                        overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out)
                     }
                 } else {
                     portraitEnterTime = 0L
@@ -220,11 +254,11 @@ enum class DigitalClockStyle(val title: String) {
     TERMINAL("Терминал")
 }
 
-// 3 разных макета календаря без фоновой заливки для защиты OLED
+// Все 3 режима показывают ПОЛНЫЙ месяц, но меняют местами верх/низ и геометрию сетки
 enum class CalendarLayoutStyle(val title: String) {
-    MONTH_GRID("Сетка месяца"),
-    BIG_DATE("Крупная дата"),
-    WEEK_STRIP("Лента недели")
+    TOP_HEADER_GRID("Дата сверху + Сетка"),
+    BOTTOM_HERO_GRID("Сетка сверху + Дата снизу"),
+    SIDE_SPLIT_GRID("Дата сбоку + Моно-сетка")
 }
 
 enum class RightWidget(val title: String) {
@@ -254,9 +288,13 @@ val colorThemes = listOf(
     ColorTheme("Коралл", Color(0xFFFF453A), Color(0xFFFF9F0A))
 )
 
+// Единая 2-секундная (2000 мс) плавная анимация для всех переходов
+private const val TRANSITION_DURATION_MS = 2000
+
 @Composable
 fun StandByScreen(
     ambientLux: Float,
+    launchTrigger: Int,
     onRequestOverlayPermission: () -> Unit
 ) {
     val context = LocalContext.current
@@ -264,19 +302,38 @@ fun StandByScreen(
     var currentDate by remember { mutableStateOf(LocalDate.now()) }
 
     var clockStyle by remember { mutableStateOf(DigitalClockStyle.FLIP) }
-    var calendarStyle by remember { mutableStateOf(CalendarLayoutStyle.MONTH_GRID) }
-    var swapPanels by remember { mutableStateOf(false) } // Меняет левую и правую сторону местами
+    var calendarStyle by remember { mutableStateOf(CalendarLayoutStyle.TOP_HEADER_GRID) }
+    var swapPanels by remember { mutableStateOf(false) }
     var autoCycleOled by remember { mutableStateOf(true) }
     var rightWidget by remember { mutableStateOf(RightWidget.CALENDAR) }
     var brightnessMode by remember { mutableStateOf(BrightnessMode.AUTO) }
     var themeIndex by remember { mutableIntStateOf(0) }
-    var showControls by remember { mutableStateOf(true) }
+    var showControls by remember { mutableStateOf(false) }
 
     var burnInOffsetX by remember { mutableIntStateOf(0) }
     var burnInOffsetY by remember { mutableIntStateOf(0) }
 
     var batteryPct by remember { mutableIntStateOf(100) }
     var isCharging by remember { mutableStateOf(false) }
+
+    // Плавное 2.2-секундное проявление из темноты AOD при повороте телефона
+    var aodRevealVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(launchTrigger) {
+        aodRevealVisible = false
+        delay(60L)
+        aodRevealVisible = true
+    }
+
+    val screenAlpha by animateFloatAsState(
+        targetValue = if (aodRevealVisible) 1f else 0f,
+        animationSpec = tween(durationMillis = 2200, easing = FastOutSlowInEasing),
+        label = "aodFadeIn"
+    )
+    val screenScale by animateFloatAsState(
+        targetValue = if (aodRevealVisible) 1f else 0.94f,
+        animationSpec = tween(durationMillis = 2200, easing = FastOutSlowInEasing),
+        label = "aodScaleIn"
+    )
 
     val isNight = when (brightnessMode) {
         BrightnessMode.AUTO -> ambientLux < 8f
@@ -296,19 +353,19 @@ fun StandByScreen(
     val currentTheme = colorThemes[themeIndex]
     val primaryColor by animateColorAsState(
         targetValue = currentTheme.primary,
-        animationSpec = tween(700),
+        animationSpec = tween(1200),
         label = "primaryColor"
     )
     val accentColor by animateColorAsState(
         targetValue = currentTheme.accent,
-        animationSpec = tween(700),
+        animationSpec = tween(1200),
         label = "accentColor"
     )
 
-    // Полный цикл анти-выгорания OLED:
-    // 1. Каждую минуту: микросдвиг координат
-    // 2. Каждые 3 минуты: плавная смена и циферблата, и макета календаря
-    // 3. Каждые 6 минут: часы и календарь меняются местами (лево <-> право)
+    // Цикл защиты OLED:
+    // - Каждую минуту: микросдвиг координат
+    // - Каждые 3 минуты: 2-секундная плавная смена часов и перестановка верха/низа календаря
+    // - Каждые 6 минут: 2-секундная плавная смена левой и правой стороны местами
     LaunchedEffect(autoCycleOled) {
         var lastMinute = -1
         var minutesCounter = 0
@@ -364,21 +421,30 @@ fun StandByScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black) // 100% True Black OLED (выключенные пиксели)
+            .background(Color.Black) // Чистый #000000
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null
             ) { showControls = !showControls }
             .padding(24.dp)
+            .graphicsLayer {
+                alpha = screenAlpha
+                scaleX = screenScale
+                scaleY = screenScale
+            }
     ) {
-        // Плавная анимация смены сторон (лево <-> право)
+        // 2-секундная плавная анимация смены сторон (лево <-> право)
         AnimatedContent(
             targetState = swapPanels,
             transitionSpec = {
-                fadeIn(animationSpec = tween(1500)) togetherWith
-                        fadeOut(animationSpec = tween(1500))
+                (fadeIn(animationSpec = tween(TRANSITION_DURATION_MS, easing = FastOutSlowInEasing)) +
+                        scaleIn(initialScale = 0.94f, animationSpec = tween(TRANSITION_DURATION_MS, easing = FastOutSlowInEasing)))
+                    .togetherWith(
+                        fadeOut(animationSpec = tween(TRANSITION_DURATION_MS, easing = FastOutSlowInEasing)) +
+                                scaleOut(targetScale = 0.94f, animationSpec = tween(TRANSITION_DURATION_MS, easing = FastOutSlowInEasing))
+                    )
             },
-            label = "SwapPanelsCrossfade"
+            label = "SwapPanelsSlowTransition"
         ) { isSwapped ->
             Row(
                 modifier = Modifier
@@ -393,7 +459,7 @@ fun StandByScreen(
                         currentTime = currentTime,
                         primaryColor = primaryColor,
                         accentColor = accentColor,
-                        modifier = Modifier.weight(1.1f).fillMaxHeight()
+                        modifier = Modifier.weight(1.08f).fillMaxHeight()
                     )
                     WidgetContainer(
                         rightWidget = rightWidget,
@@ -405,7 +471,7 @@ fun StandByScreen(
                         targetBrightnessPct = (targetBrightness * 100).toInt(),
                         primaryColor = primaryColor,
                         accentColor = accentColor,
-                        modifier = Modifier.weight(0.9f).fillMaxHeight()
+                        modifier = Modifier.weight(0.92f).fillMaxHeight()
                     )
                 } else {
                     WidgetContainer(
@@ -418,26 +484,27 @@ fun StandByScreen(
                         targetBrightnessPct = (targetBrightness * 100).toInt(),
                         primaryColor = primaryColor,
                         accentColor = accentColor,
-                        modifier = Modifier.weight(0.9f).fillMaxHeight()
+                        modifier = Modifier.weight(0.92f).fillMaxHeight()
                     )
                     ClockContainer(
                         clockStyle = clockStyle,
                         currentTime = currentTime,
                         primaryColor = primaryColor,
                         accentColor = accentColor,
-                        modifier = Modifier.weight(1.1f).fillMaxHeight()
+                        modifier = Modifier.weight(1.08f).fillMaxHeight()
                     )
                 }
             }
         }
 
-        // Верхняя панель настроек
+        // Верхняя панель настроек (вызывается по касанию экрана)
         if (showControls) {
             Row(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .clip(RoundedCornerShape(50))
-                    .background(Color(0xEE1C1C1E))
+                    .background(Color(0xEE121214))
+                    .border(1.dp, Color(0x33FFFFFF), RoundedCornerShape(50))
                     .horizontalScroll(rememberScrollState())
                     .padding(horizontal = 14.dp, vertical = 6.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -460,7 +527,7 @@ fun StandByScreen(
                 }) {
                     Icon(Icons.Default.CalendarMonth, contentDescription = null, tint = Color.White)
                     Spacer(Modifier.width(5.dp))
-                    Text("Вид даты: ${calendarStyle.title}", color = Color.White, fontSize = 12.sp)
+                    Text("Макет месяца: ${calendarStyle.title}", color = Color.White, fontSize = 12.sp)
                 }
 
                 TextButton(onClick = { swapPanels = !swapPanels }) {
@@ -477,7 +544,7 @@ fun StandByScreen(
                     )
                     Spacer(Modifier.width(4.dp))
                     Text(
-                        if (autoCycleOled) "OLED-защита: ВКЛ" else "OLED-защита: ВЫКЛ",
+                        if (autoCycleOled) "OLED-динамика: ВКЛ" else "OLED-динамика: ВЫКЛ",
                         color = if (autoCycleOled) accentColor else Color.LightGray,
                         fontSize = 12.sp
                     )
@@ -539,13 +606,18 @@ fun ClockContainer(
         modifier = modifier,
         contentAlignment = Alignment.Center
     ) {
+        // 2-секундная плавная анимация смены цифровых циферблатов
         AnimatedContent(
             targetState = clockStyle,
             transitionSpec = {
-                fadeIn(animationSpec = tween(1500)) togetherWith
-                        fadeOut(animationSpec = tween(1500))
+                (fadeIn(animationSpec = tween(TRANSITION_DURATION_MS, easing = FastOutSlowInEasing)) +
+                        scaleIn(initialScale = 0.92f, animationSpec = tween(TRANSITION_DURATION_MS, easing = FastOutSlowInEasing)))
+                    .togetherWith(
+                        fadeOut(animationSpec = tween(TRANSITION_DURATION_MS, easing = FastOutSlowInEasing)) +
+                                scaleOut(targetScale = 0.92f, animationSpec = tween(TRANSITION_DURATION_MS, easing = FastOutSlowInEasing))
+                    )
             },
-            label = "ClockStyleCrossfade"
+            label = "ClockStyleSlowCrossfade"
         ) { targetStyle ->
             when (targetStyle) {
                 DigitalClockStyle.FLIP -> FlipClockView(
@@ -586,39 +658,44 @@ fun WidgetContainer(
     accentColor: Color,
     modifier: Modifier = Modifier
 ) {
-    // Полностью черный фон без заливки — пиксели вокруг текста выключены!
     Box(
         modifier = modifier
             .fillMaxHeight()
-            .padding(16.dp),
+            .background(Color.Black) // 100% True Black
+            .padding(12.dp),
         contentAlignment = Alignment.Center
     ) {
         when (rightWidget) {
             RightWidget.CALENDAR -> {
+                // 2-секундная плавная смена макетов полного месяца
                 AnimatedContent(
                     targetState = calendarStyle,
                     transitionSpec = {
-                        fadeIn(animationSpec = tween(1500)) togetherWith
-                                fadeOut(animationSpec = tween(1500))
+                        (fadeIn(animationSpec = tween(TRANSITION_DURATION_MS, easing = FastOutSlowInEasing)) +
+                                scaleIn(initialScale = 0.92f, animationSpec = tween(TRANSITION_DURATION_MS, easing = FastOutSlowInEasing)))
+                            .togetherWith(
+                                fadeOut(animationSpec = tween(TRANSITION_DURATION_MS, easing = FastOutSlowInEasing)) +
+                                        scaleOut(targetScale = 0.92f, animationSpec = tween(TRANSITION_DURATION_MS, easing = FastOutSlowInEasing))
+                            )
                     },
-                    label = "CalendarStyleCrossfade"
+                    label = "CalendarStyleSlowCrossfade"
                 ) { style ->
                     when (style) {
-                        CalendarLayoutStyle.MONTH_GRID -> CalendarMonthGridView(
+                        CalendarLayoutStyle.TOP_HEADER_GRID -> CalendarTopHeaderMonthView(
                             date = currentDate,
                             batteryPct = batteryPct,
                             isCharging = isCharging,
                             primaryColor = primaryColor,
                             accentColor = accentColor
                         )
-                        CalendarLayoutStyle.BIG_DATE -> CalendarBigDateView(
+                        CalendarLayoutStyle.BOTTOM_HERO_GRID -> CalendarBottomHeroMonthView(
                             date = currentDate,
                             batteryPct = batteryPct,
                             isCharging = isCharging,
                             primaryColor = primaryColor,
                             accentColor = accentColor
                         )
-                        CalendarLayoutStyle.WEEK_STRIP -> CalendarWeekStripView(
+                        CalendarLayoutStyle.SIDE_SPLIT_GRID -> CalendarSideSplitMonthView(
                             date = currentDate,
                             batteryPct = batteryPct,
                             isCharging = isCharging,
@@ -644,7 +721,10 @@ fun WidgetContainer(
     }
 }
 
-// 1. КОНТУРНЫЕ ПЕРЕКИДНЫЕ ЧАСЫ НА ЧЕРНОМ ФОНЕ (БЕЗ СЕРОЙ ПОДЛОЖКИ)
+// =========================================================================
+// ЦИФРОВЫЕ ЧАСЫ (4 СТИЛЯ НА ЧИСТОМ ЧЕРНОМ ФОНЕ)
+// =========================================================================
+
 @Composable
 fun FlipClockView(
     time: LocalTime,
@@ -688,14 +768,14 @@ fun FlipCard(
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(28.dp))
-            .background(Color.Black) // Чистый черный фон для OLED
+            .background(Color.Black)
             .border(1.5.dp, primaryColor.copy(alpha = 0.22f), RoundedCornerShape(28.dp)),
         contentAlignment = Alignment.Center
     ) {
         Text(
             text = text,
             color = primaryColor,
-            fontSize = 108.sp,
+            fontSize = 106.sp,
             fontWeight = FontWeight.Bold,
             fontFamily = FontFamily.SansSerif,
             textAlign = TextAlign.Center
@@ -709,7 +789,7 @@ fun FlipCard(
         if (subtitle.isNotEmpty()) {
             Text(
                 text = subtitle,
-                color = accentColor.copy(alpha = 0.8f),
+                color = accentColor.copy(alpha = 0.85f),
                 fontSize = 19.sp,
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier
@@ -720,7 +800,6 @@ fun FlipCard(
     }
 }
 
-// 2. КРУПНЫЕ ЧАСЫ DUO
 @Composable
 fun DigitalDuoClockView(
     time: LocalTime,
@@ -737,7 +816,7 @@ fun DigitalDuoClockView(
         Text(
             text = "$hourStr:$minStr",
             color = primaryColor,
-            fontSize = 114.sp,
+            fontSize = 112.sp,
             fontWeight = FontWeight.Bold,
             letterSpacing = (-3).sp
         )
@@ -751,7 +830,6 @@ fun DigitalDuoClockView(
     }
 }
 
-// 3. ТОНКИЕ ДВУХЭТАЖНЫЕ ЧАСЫ (МИНИМУМ АКТИВНЫХ ПИКСЕЛЕЙ)
 @Composable
 fun StackedThinClockView(
     time: LocalTime,
@@ -819,7 +897,6 @@ fun StackedThinClockView(
     }
 }
 
-// 4. МОНОШИРИННЫЙ ТЕРМИНАЛ НА ЧЕРНОМ ФОНЕ
 @Composable
 fun TerminalClockView(
     time: LocalTime,
@@ -850,14 +927,14 @@ fun TerminalClockView(
             Text(
                 text = "$hourStr:$minStr",
                 color = primaryColor,
-                fontSize = 86.sp,
+                fontSize = 84.sp,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.Light
             )
             Text(
                 text = ":$secStr",
                 color = accentColor,
-                fontSize = 34.sp,
+                fontSize = 32.sp,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.Normal,
                 modifier = Modifier.padding(bottom = 12.dp, start = 4.dp)
@@ -866,9 +943,13 @@ fun TerminalClockView(
     }
 }
 
-// КАЛЕНДАРЬ - РЕЖИМ 1: СЕТКА МЕСЯЦА БЕЗ ФОНОВОЙ ЗАЛИВКИ (КОНТУРНОЕ ВЫДЕЛЕНИЕ ДНЯ)
+// =========================================================================
+// КАЛЕНДАРИ ПОЛНОГО МЕСЯЦА (3 ДИЗАЙНА С ПЕРЕСТАНОВКОЙ ВЕРХА И НИЗА)
+// =========================================================================
+
+// МАКЕТ 1: Крупная дата и текст месяца СВЕРХУ, полная сетка месяца СНИЗУ
 @Composable
-fun CalendarMonthGridView(
+fun CalendarTopHeaderMonthView(
     date: LocalDate,
     batteryPct: Int,
     isCharging: Boolean,
@@ -878,33 +959,44 @@ fun CalendarMonthGridView(
     val ruLocale = Locale("ru", "RU")
     val dayOfWeek = date.dayOfWeek.getDisplayName(TextStyle.FULL, ruLocale).uppercase(ruLocale)
     val monthName = date.month.getDisplayName(TextStyle.FULL_STANDALONE, ruLocale).uppercase(ruLocale)
-    val yearMonth = YearMonth.from(date)
-    val daysInMonth = yearMonth.lengthOfMonth()
-    val firstDayOffset = yearMonth.atDay(1).dayOfWeek.value - 1
 
     Column(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.SpaceBetween
     ) {
+        // ВЕРХ: Крупное число + месяц и день недели + батарея
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.Top
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(modifier = Modifier.weight(1f)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 Text(
-                    text = dayOfWeek,
+                    text = String.format("%02d", date.dayOfMonth),
                     color = accentColor,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.2.sp
+                    fontSize = 44.sp,
+                    fontWeight = FontWeight.Light,
+                    lineHeight = 44.sp
                 )
-                Text(
-                    text = "${date.dayOfMonth} $monthName",
-                    color = primaryColor,
-                    fontSize = 21.sp,
-                    fontWeight = FontWeight.Bold
-                )
+                Column {
+                    Text(
+                        text = monthName,
+                        color = primaryColor,
+                        fontSize = 19.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = 1.sp
+                    )
+                    Text(
+                        text = dayOfWeek,
+                        color = primaryColor.copy(alpha = 0.6f),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = 1.sp
+                    )
+                }
             }
 
             BatteryBadge(
@@ -915,62 +1007,20 @@ fun CalendarMonthGridView(
             )
         }
 
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            val weekDays = listOf("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС")
-            Row(modifier = Modifier.fillMaxWidth()) {
-                weekDays.forEach { d ->
-                    Text(
-                        text = d,
-                        color = primaryColor.copy(alpha = 0.4f),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.weight(1f)
-                    )
-                }
-            }
-
-            val totalCells = firstDayOffset + daysInMonth
-            val rows = (totalCells + 6) / 7
-            for (r in 0 until rows) {
-                Row(modifier = Modifier.fillMaxWidth()) {
-                    for (c in 0 until 7) {
-                        val cellIndex = r * 7 + c
-                        val dayNum = cellIndex - firstDayOffset + 1
-                        if (dayNum in 1..daysInMonth) {
-                            val isToday = dayNum == date.dayOfMonth
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(24.dp)
-                                    .then(
-                                        if (isToday) {
-                                            // Контурное кольцо вместо сплошного пятна для защиты OLED
-                                            Modifier.border(1.5.dp, accentColor, CircleShape)
-                                        } else Modifier
-                                    ),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = dayNum.toString(),
-                                    color = if (isToday) accentColor else primaryColor.copy(alpha = 0.8f),
-                                    fontSize = 13.sp,
-                                    fontWeight = if (isToday) FontWeight.Bold else FontWeight.Light
-                                )
-                            }
-                        } else {
-                            Spacer(modifier = Modifier.weight(1f))
-                        }
-                    }
-                }
-            }
-        }
+        // НИЗ: Полная сетка месяца (стиль 1 - тонкие круглые контуры)
+        MonthGridTable(
+            date = date,
+            primaryColor = primaryColor,
+            accentColor = accentColor,
+            highlightStyle = GridHighlightStyle.CIRCLE_OUTLINE,
+            fontFamily = FontFamily.SansSerif
+        )
     }
 }
 
-// КАЛЕНДАРЬ - РЕЖИМ 2: КРУПНОЕ ТОНКОЕ ЧИСЛО И ПРОГРЕСС БАТАРЕИ
+// МАКЕТ 2 (МЕНЯЮТСЯ МЕСТАМИ): Полная сетка месяца СВЕРХУ, а крупная дата и месяц СНИЗУ
 @Composable
-fun CalendarBigDateView(
+fun CalendarBottomHeroMonthView(
     date: LocalDate,
     batteryPct: Int,
     isCharging: Boolean,
@@ -983,47 +1033,67 @@ fun CalendarBigDateView(
 
     Column(
         modifier = Modifier.fillMaxSize(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.SpaceEvenly
+        verticalArrangement = Arrangement.SpaceBetween
     ) {
-        BatteryBadge(
-            batteryPct = batteryPct,
-            isCharging = isCharging,
+        // ВЕРХ: Полная сетка месяца (стиль 2 - геометрическая рамка)
+        MonthGridTable(
+            date = date,
             primaryColor = primaryColor,
-            accentColor = accentColor
+            accentColor = accentColor,
+            highlightStyle = GridHighlightStyle.ROUNDED_BOX,
+            fontFamily = FontFamily.SansSerif
         )
 
-        Text(
-            text = date.dayOfMonth.toString(),
-            color = primaryColor,
-            fontSize = 104.sp,
-            fontWeight = FontWeight.Thin,
-            lineHeight = 100.sp
-        )
+        // НИЗ: Крупная дата числом, месяц и батарея внизу
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Bottom
+        ) {
+            BatteryBadge(
+                batteryPct = batteryPct,
+                isCharging = isCharging,
+                primaryColor = primaryColor,
+                accentColor = accentColor
+            )
 
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                text = monthGenitive,
-                color = accentColor,
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 3.sp
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = dayOfWeek,
-                color = primaryColor.copy(alpha = 0.65f),
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
-                letterSpacing = 1.5.sp
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Column(horizontalAlignment = Alignment.End) {
+                    Text(
+                        text = dayOfWeek,
+                        color = accentColor,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.2.sp
+                    )
+                    Text(
+                        text = monthGenitive,
+                        color = primaryColor,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.sp
+                    )
+                }
+                Text(
+                    text = String.format("%02d", date.dayOfMonth),
+                    color = primaryColor,
+                    fontSize = 46.sp,
+                    fontWeight = FontWeight.Thin,
+                    lineHeight = 46.sp
+                )
+            }
         }
     }
 }
 
-// КАЛЕНДАРЬ - РЕЖИМ 3: ЛЕНТА ТЕКУЩЕЙ НЕДЕЛИ (7 ДНЕЙ)
+// МАКЕТ 3 (БОКОВОЙ СПЛИТ): Крупная дата и батарея в колонке СЛЕВА, а моно-сетка всего месяца СПРАВА
 @Composable
-fun CalendarWeekStripView(
+fun CalendarSideSplitMonthView(
     date: LocalDate,
     batteryPct: Int,
     isCharging: Boolean,
@@ -1031,79 +1101,162 @@ fun CalendarWeekStripView(
     accentColor: Color
 ) {
     val ruLocale = Locale("ru", "RU")
+    val dayShort = date.dayOfWeek.getDisplayName(TextStyle.SHORT, ruLocale).uppercase(ruLocale)
     val monthName = date.month.getDisplayName(TextStyle.FULL_STANDALONE, ruLocale).uppercase(ruLocale)
-    val dayOfWeekFull = date.dayOfWeek.getDisplayName(TextStyle.FULL, ruLocale).uppercase(ruLocale)
-    val startOfWeek = date.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY))
 
-    Column(
+    Row(
         modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.SpaceEvenly
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+        // Левая узкая колонка с крупным числом, месяцем и зарядом
+        Column(
+            modifier = Modifier
+                .weight(0.36f)
+                .fillMaxHeight(),
+            verticalArrangement = Arrangement.SpaceBetween,
+            horizontalAlignment = Alignment.Start
         ) {
-            Text(
-                text = "$monthName ${date.year}",
-                color = accentColor,
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 2.sp
-            )
             BatteryBadge(
                 batteryPct = batteryPct,
                 isCharging = isCharging,
                 primaryColor = primaryColor,
                 accentColor = accentColor
             )
-        }
 
-        // Лента 7 дней текущей недели
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            val shortNames = listOf("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС")
-            for (i in 0..6) {
-                val dayDate = startOfWeek.plusDays(i.toLong())
-                val isToday = dayDate == date
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(horizontal = 2.dp)
-                        .then(
-                            if (isToday) {
-                                Modifier.border(1.5.dp, accentColor, RoundedCornerShape(14.dp))
-                            } else Modifier
-                        )
-                        .padding(vertical = 10.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        text = shortNames[i],
-                        color = if (isToday) accentColor else primaryColor.copy(alpha = 0.45f),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = dayDate.dayOfMonth.toString(),
-                        color = if (isToday) primaryColor else primaryColor.copy(alpha = 0.75f),
-                        fontSize = 17.sp,
-                        fontWeight = if (isToday) FontWeight.Bold else FontWeight.Light
-                    )
-                }
+            Column {
+                Text(
+                    text = String.format("%02d", date.dayOfMonth),
+                    color = accentColor,
+                    fontSize = 54.sp,
+                    fontWeight = FontWeight.Light,
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 52.sp
+                )
+                Text(
+                    text = monthName,
+                    color = primaryColor,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp
+                )
+                Text(
+                    text = "$dayShort • ${date.year}",
+                    color = primaryColor.copy(alpha = 0.5f),
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace
+                )
             }
         }
 
-        Text(
-            text = "СЕГОДНЯ • $dayOfWeekFull, ${date.dayOfMonth}",
-            color = primaryColor.copy(alpha = 0.6f),
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Medium,
-            letterSpacing = 1.2.sp
-        )
+        // Правая часть: полная сетка месяца моноширинным шрифтом с нижним подчеркиванием даты
+        Box(
+            modifier = Modifier
+                .weight(0.64f)
+                .fillMaxHeight(),
+            contentAlignment = Alignment.Center
+        ) {
+            MonthGridTable(
+                date = date,
+                primaryColor = primaryColor,
+                accentColor = accentColor,
+                highlightStyle = GridHighlightStyle.UNDERLINE_DOT,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+    }
+}
+
+enum class GridHighlightStyle {
+    CIRCLE_OUTLINE,
+    ROUNDED_BOX,
+    UNDERLINE_DOT
+}
+
+@Composable
+fun MonthGridTable(
+    date: LocalDate,
+    primaryColor: Color,
+    accentColor: Color,
+    highlightStyle: GridHighlightStyle,
+    fontFamily: FontFamily
+) {
+    val yearMonth = YearMonth.from(date)
+    val daysInMonth = yearMonth.lengthOfMonth()
+    val firstDayOffset = yearMonth.atDay(1).dayOfWeek.value - 1
+
+    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        val weekDays = listOf("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС")
+        Row(modifier = Modifier.fillMaxWidth()) {
+            weekDays.forEachIndexed { index, d ->
+                val isWeekendHeader = index >= 5
+                Text(
+                    text = d,
+                    color = if (isWeekendHeader) accentColor.copy(alpha = 0.65f) else primaryColor.copy(alpha = 0.4f),
+                    fontSize = 10.sp,
+                    fontFamily = fontFamily,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+
+        val totalCells = firstDayOffset + daysInMonth
+        val rows = (totalCells + 6) / 7
+        for (r in 0 until rows) {
+            Row(modifier = Modifier.fillMaxWidth()) {
+                for (c in 0 until 7) {
+                    val cellIndex = r * 7 + c
+                    val dayNum = cellIndex - firstDayOffset + 1
+                    if (dayNum in 1..daysInMonth) {
+                        val isToday = dayNum == date.dayOfMonth
+                        val isWeekend = c >= 5
+
+                        val cellModifier = when {
+                            !isToday -> Modifier
+                            highlightStyle == GridHighlightStyle.CIRCLE_OUTLINE ->
+                                Modifier.border(1.5.dp, accentColor, CircleShape)
+                            highlightStyle == GridHighlightStyle.ROUNDED_BOX ->
+                                Modifier.border(1.5.dp, accentColor, RoundedCornerShape(6.dp))
+                            else -> Modifier
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(22.dp)
+                                .then(cellModifier),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    text = dayNum.toString(),
+                                    color = when {
+                                        isToday -> accentColor
+                                        isWeekend -> primaryColor.copy(alpha = 0.55f)
+                                        else -> primaryColor.copy(alpha = 0.85f)
+                                    },
+                                    fontSize = 12.sp,
+                                    fontFamily = fontFamily,
+                                    fontWeight = if (isToday) FontWeight.ExtraBold else FontWeight.Light
+                                )
+                                if (isToday && highlightStyle == GridHighlightStyle.UNDERLINE_DOT) {
+                                    Box(
+                                        modifier = Modifier
+                                            .width(12.dp)
+                                            .height(1.5.dp)
+                                            .background(accentColor)
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        Spacer(modifier = Modifier.weight(1f))
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1116,8 +1269,8 @@ fun BatteryBadge(
 ) {
     Row(
         modifier = Modifier
-            .border(1.dp, primaryColor.copy(alpha = 0.28f), RoundedCornerShape(50))
-            .padding(horizontal = 10.dp, vertical = 5.dp),
+            .border(1.dp, primaryColor.copy(alpha = 0.25f), RoundedCornerShape(50))
+            .padding(horizontal = 9.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp)
     ) {
@@ -1125,12 +1278,12 @@ fun BatteryBadge(
             imageVector = if (isCharging) Icons.Default.Bolt else Icons.Default.BatteryStd,
             contentDescription = null,
             tint = if (isCharging) accentColor else primaryColor,
-            modifier = Modifier.size(16.dp)
+            modifier = Modifier.size(15.dp)
         )
         Text(
             text = "$batteryPct%",
             color = primaryColor,
-            fontSize = 13.sp,
+            fontSize = 12.sp,
             fontWeight = FontWeight.Bold
         )
     }
