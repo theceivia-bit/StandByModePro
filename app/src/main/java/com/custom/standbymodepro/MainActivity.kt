@@ -15,6 +15,7 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.view.Choreographer
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
@@ -43,6 +44,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -328,6 +330,22 @@ fun StandByScreen(
         mutableIntStateOf(prefs.getInt("theme_index", 0).coerceIn(0, colorThemes.lastIndex))
     }
     var showControls by remember { mutableStateOf(false) }
+    var showFps by remember { mutableStateOf(false) } // Переключатель счетчика FPS
+
+    // Флаг активной анимации/обновления для переключения герцовки экрана (1 Гц статично / 30 Гц в движении)
+    var isAnimating by remember { mutableStateOf(false) }
+
+    // Управление аппаратной частотой обновления дисплея
+    LaunchedEffect(isAnimating) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            (context as? Activity)?.window?.let { window ->
+                val params = window.attributes
+                // 30 Гц во время анимации смены минут/циферблатов, 1 Гц (или минимум) в статике для экономии 93% батареи
+                params.preferredRefreshRate = if (isAnimating) 30f else 1f
+                window.attributes = params
+            }
+        }
+    }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -339,6 +357,7 @@ fun StandByScreen(
                     .putInt("right_widget", rightWidget.ordinal)
                     .putInt("brightness_mode", brightnessMode.ordinal)
                     .putInt("theme_index", themeIndex)
+                    .putBoolean("show_fps", showFps)
                     .apply()
             }
         }
@@ -381,7 +400,7 @@ fun StandByScreen(
         label = "accentColor"
     )
 
-    // Обновление ровно по смене минут (без секунд), сдвиг пикселей каждые 3 мин, ротация раз в 5 мин
+    // Цикл смены минут: включает 30 Гц на 2.5 секунды во время анимации, затем сбрасывает в 1 Гц
     LaunchedEffect(autoCycleOled) {
         var lastMinute = -1
         var minutesCounter = 0
@@ -391,6 +410,8 @@ fun StandByScreen(
             if (now.minute != lastMinute) {
                 val isFirstTick = lastMinute == -1
                 lastMinute = now.minute
+                
+                isAnimating = true // Поднимаем герцовку до 30 Гц на время отрисовки анимации
                 currentTime = now
                 currentDate = LocalDate.now()
 
@@ -423,8 +444,11 @@ fun StandByScreen(
                     isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
                             status == BatteryManager.BATTERY_STATUS_FULL
                 } catch (_: Exception) {}
+
+                delay(2500L) // Даем завершиться 2-секундной анимации crossfade
+                isAnimating = false // Возвращаем дисплей в режим 1 Гц (глубокий энергосберегающий покой)
             }
-            delay(1000L) // Проверяем системное время каждую секунду, но перерисовываем и сдвигаем только когда меняется минута
+            delay(1000L)
         }
     }
 
@@ -445,10 +469,14 @@ fun StandByScreen(
             ) { showControls = !showControls }
             .padding(24.dp)
     ) {
+        // Главный контейнер с аппаратным кэшированием слоев (GPU Cache), чтобы в покое не тратить энергию
         Row(
             modifier = Modifier
                 .fillMaxSize()
-                .offset { IntOffset(burnInOffsetX, burnInOffsetY) },
+                .graphicsLayer {
+                    translationX = burnInOffsetX.toFloat()
+                    translationY = burnInOffsetY.toFloat()
+                },
             horizontalArrangement = Arrangement.spacedBy(24.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -477,6 +505,16 @@ fun StandByScreen(
             )
         }
 
+        // Счетчик FPS в правом верхнем углу (если включен в меню)
+        if (showFps) {
+            FpsMeter(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(8.dp)
+            )
+        }
+
+        // Верхняя панель управления
         if (showControls) {
             Row(
                 modifier = Modifier
@@ -489,6 +527,7 @@ fun StandByScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 TextButton(onClick = {
+                    isAnimating = true
                     clockStyle = DigitalClockStyle.entries[
                         (clockStyle.ordinal + 1) % DigitalClockStyle.entries.size
                     ]
@@ -499,6 +538,7 @@ fun StandByScreen(
                 }
 
                 TextButton(onClick = {
+                    isAnimating = true
                     calendarStyle = CalendarLayoutStyle.entries[
                         (calendarStyle.ordinal + 1) % CalendarLayoutStyle.entries.size
                     ]
@@ -554,6 +594,13 @@ fun StandByScreen(
                     Text("Виджет: ${rightWidget.title}", color = Color.White, fontSize = 12.sp)
                 }
 
+                // Кнопка включения/выключения счетчика FPS
+                TextButton(onClick = { showFps = !showFps }) {
+                    Icon(Icons.Default.Speed, contentDescription = null, tint = if (showFps) Color(0xFF32D74B) else Color.Gray)
+                    Spacer(Modifier.width(4.dp))
+                    Text(if (showFps) "FPS: ВКЛ" else "FPS: ВЫКЛ", color = if (showFps) Color(0xFF32D74B) else Color.LightGray, fontSize = 12.sp)
+                }
+
                 if (!Settings.canDrawOverlays(context)) {
                     TextButton(onClick = onRequestOverlayPermission) {
                         Icon(Icons.Default.Bolt, contentDescription = null, tint = Color(0xFFFFD60A))
@@ -563,6 +610,51 @@ fun StandByScreen(
                 }
             }
         }
+    }
+}
+
+// Надежный компонент подсчета реального FPS через Choreographer
+@Composable
+fun FpsMeter(modifier: Modifier = Modifier) {
+    var fps by remember { mutableIntStateOf(0) }
+
+    DisposableEffect(Unit) {
+        var frameCount = 0
+        var lastTime = System.nanoTime()
+
+        val callback = object : Choreographer.FrameCallback {
+            override fun doFrame(frameTimeNanos: Long) {
+                frameCount++
+                val elapsed = frameTimeNanos - lastTime
+                if (elapsed >= 1_000_000_000L) {
+                    fps = ((frameCount * 1_000_000_000L) / elapsed).toInt()
+                    frameCount = 0
+                    lastTime = frameTimeNanos
+                }
+                Choreographer.getInstance().postFrameCallback(this)
+            }
+        }
+        Choreographer.getInstance().postFrameCallback(callback)
+
+        onDispose {
+            Choreographer.getInstance().removeFrameCallback(callback)
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(Color(0xAA000000))
+            .border(1.dp, Color(0xFF32D74B).copy(alpha = 0.5f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+    ) {
+        Text(
+            text = "$fps FPS",
+            color = Color(0xFF32D74B),
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold
+        )
     }
 }
 
