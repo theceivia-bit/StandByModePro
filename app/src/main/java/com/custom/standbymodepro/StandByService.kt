@@ -30,6 +30,10 @@ class StandByService : Service(), SensorEventListener {
     private var isMonitoring = false
     private var landscapeEnterTime = 0L
     private var standbyLaunchedInCurrentCycle = false
+    private var lastSensorEventTime = 0L
+
+    // Более редкий опрос акселерометра (≈ 2 раза в секунду вместо 5)
+    private val SENSOR_SAMPLING_US = 500_000  // 500 мс
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -44,6 +48,8 @@ class StandByService : Service(), SensorEventListener {
                 Intent.ACTION_SCREEN_ON -> {
                     if (keyguardManager?.isKeyguardLocked == true) {
                         startSensorMonitoring()
+                    } else {
+                        stopSensorMonitoring()
                     }
                 }
             }
@@ -66,6 +72,7 @@ class StandByService : Service(), SensorEventListener {
         }
         registerReceiver(screenReceiver, filter)
 
+        // Запускаем мониторинг только если экран выключен или заблокирован
         if (powerManager?.isInteractive == false || keyguardManager?.isKeyguardLocked == true) {
             startSensorMonitoring()
         }
@@ -106,7 +113,9 @@ class StandByService : Service(), SensorEventListener {
         if (isMonitoring) return
         isMonitoring = true
         landscapeEnterTime = 0L
+        lastSensorEventTime = System.currentTimeMillis()
 
+        // Короткий WakeLock (40 минут). Если мониторинг всё ещё нужен — перезапросим.
         if (wakeLock == null) {
             wakeLock = powerManager?.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
@@ -114,11 +123,11 @@ class StandByService : Service(), SensorEventListener {
             )
         }
         if (wakeLock?.isHeld == false) {
-            wakeLock?.acquire(12 * 60 * 60 * 1000L)
+            wakeLock?.acquire(40 * 60 * 1000L) // 40 минут вместо 12 часов
         }
 
         accelerometer?.let {
-            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+            sensorManager?.registerListener(this, it, SENSOR_SAMPLING_US)
         }
     }
 
@@ -126,6 +135,7 @@ class StandByService : Service(), SensorEventListener {
         if (!isMonitoring) return
         isMonitoring = false
         sensorManager?.unregisterListener(this)
+
         if (wakeLock?.isHeld == true) {
             try {
                 wakeLock?.release()
@@ -136,19 +146,23 @@ class StandByService : Service(), SensorEventListener {
     override fun onSensorChanged(event: SensorEvent?) {
         if (event?.sensor?.type != Sensor.TYPE_ACCELEROMETER) return
 
+        val now = System.currentTimeMillis()
+        // Дополнительная защита от слишком частых событий
+        if (now - lastSensorEventTime < 400) return
+        lastSensorEventTime = now
+
         val x = event.values[0]
         val y = event.values[1]
         val z = event.values[2]
 
-        val isLandscape = abs(x) > 7.0f && abs(y) < 4.0f && abs(z) < 7.5f
+        // Чуть мягче пороги — лучше работает в подставках
+        val isLandscape = abs(x) > 6.2f && abs(y) < 4.8f && abs(z) < 8.0f
         val isPortrait = abs(y) > 6.5f && abs(x) < 4.5f
-
-        val now = System.currentTimeMillis()
 
         if (isLandscape) {
             if (landscapeEnterTime == 0L) {
                 landscapeEnterTime = now
-            } else if (now - landscapeEnterTime > 900L && !standbyLaunchedInCurrentCycle) {
+            } else if (now - landscapeEnterTime > 800L && !standbyLaunchedInCurrentCycle) {
                 if (Settings.canDrawOverlays(this)) {
                     standbyLaunchedInCurrentCycle = true
                     wakeUpAndLaunchStandBy()
@@ -171,7 +185,7 @@ class StandByService : Service(), SensorEventListener {
                         PowerManager.ON_AFTER_RELEASE,
                 "StandByModePro::WakeUpScreen"
             )
-            screenWake?.acquire(3000L)
+            screenWake?.acquire(2500L)
 
             val launchIntent = Intent(this, MainActivity::class.java).apply {
                 addFlags(
