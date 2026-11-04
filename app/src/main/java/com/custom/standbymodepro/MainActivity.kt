@@ -17,7 +17,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.view.FrameMetrics
 import android.view.View
 import android.view.Window
 import android.view.WindowInsets
@@ -30,10 +29,13 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
@@ -49,6 +51,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
@@ -59,17 +63,25 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.YearMonth
+import java.time.format.DateTimeFormatter
 import java.time.format.TextStyle
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlin.random.Random
 
 class MainActivity : ComponentActivity(), SensorEventListener {
@@ -176,7 +188,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             }
         }
         if (sampledLux != null) {
-            // Гистерезис порога 8 лк + фильтр мелких колебаний, чтобы не будить UI лишней рекомпозицией
             val crossedNightThreshold = (sampledLux < 8f) != (currentLux < 8f)
             if (crossedNightThreshold || abs(sampledLux - currentLux) >= 5f) {
                 currentLux = sampledLux
@@ -213,7 +224,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sendBroadcast(Intent(StandByService.ACTION_ACTIVITY_RESUMED).setPackage(packageName))
         window.decorView.post { hideSystemUI() }
 
-        // Экономичный опрос раз в 1 секунду с аппаратным буфером 2 секунды для выхода при повороте в портрет
         accelerometer?.let {
             sensorManager?.registerListener(this, it, 1_000_000, 2_000_000)
         }
@@ -264,15 +274,12 @@ enum class DigitalClockStyle(val title: String) {
     TERMINAL("Терминал")
 }
 
-enum class CalendarLayoutStyle(val title: String) {
-    LAYOUT_TOP("Дата сверху"),
-    LAYOUT_BOTTOM("Дата снизу")
-}
-
-enum class RightWidget(val title: String) {
-    CALENDAR("Календарь"),
-    POMODORO_TIMER("Таймер"),
-    BATTERY_INFO("Питание")
+// Единая ротация правой панели: 2 календаря и 2 виджета погоды чередуют друг друга
+enum class RightPanelMode(val title: String) {
+    CALENDAR_TOP("Календарь 1"),
+    WEATHER_CURRENT("Погода: Сейчас"),
+    CALENDAR_BOTTOM("Календарь 2"),
+    WEATHER_FORECAST("Погода: Прогноз")
 }
 
 enum class BrightnessMode(val title: String) {
@@ -296,6 +303,25 @@ val colorThemes = listOf(
     ColorTheme("Коралл", Color(0xFFFF453A), Color(0xFFFF9F0A))
 )
 
+data class DayForecast(
+    val dayName: String,
+    val dateShort: String,
+    val maxTemp: Int,
+    val minTemp: Int,
+    val weatherCode: Int
+)
+
+data class WeatherData(
+    val temp: Int,
+    val feelsLike: Int,
+    val weatherCode: Int,
+    val humidity: Int,
+    val windSpeed: Int,
+    val pressureMmHg: Int,
+    val daily: List<DayForecast>,
+    val updatedTime: String
+)
+
 private const val PREFS_NAME = "standby_mode_prefs"
 
 @Composable
@@ -306,6 +332,7 @@ fun StandByScreen(
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val coroutineScope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
 
     var currentTime by remember { mutableStateOf(LocalTime.now()) }
@@ -315,16 +342,15 @@ fun StandByScreen(
         val saved = prefs.getInt("clock_style", 0).coerceIn(0, DigitalClockStyle.entries.lastIndex)
         mutableStateOf(DigitalClockStyle.entries[saved])
     }
-    var calendarStyle by remember {
-        val saved = prefs.getInt("calendar_style", 0).coerceIn(0, CalendarLayoutStyle.entries.lastIndex)
-        mutableStateOf(CalendarLayoutStyle.entries[saved])
+    var rightPanelMode by remember {
+        val saved = prefs.getInt("right_panel_mode", 0).coerceIn(0, RightPanelMode.entries.lastIndex)
+        mutableStateOf(RightPanelMode.entries[saved])
     }
+    // Направление анимации при свайпе: 1 (вверх -> следующий), -1 (вниз -> предыдущий)
+    var swipeDirection by remember { mutableIntStateOf(1) }
+
     var autoCycleOled by remember {
         mutableStateOf(prefs.getBoolean("auto_cycle_oled", true))
-    }
-    var rightWidget by remember {
-        val saved = prefs.getInt("right_widget", 0).coerceIn(0, RightWidget.entries.lastIndex)
-        mutableStateOf(RightWidget.entries[saved])
     }
     var brightnessMode by remember {
         val saved = prefs.getInt("brightness_mode", 0).coerceIn(0, BrightnessMode.entries.lastIndex)
@@ -336,21 +362,41 @@ fun StandByScreen(
     var showControls by remember { mutableStateOf(false) }
     var showFps by remember { mutableStateOf(prefs.getBoolean("show_fps", false)) }
 
-    // Флаг активной анимации: включается только при смене стилей или темы
+    var weatherData by remember {
+        mutableStateOf(
+            prefs.getString("cached_weather_json", null)?.let { parseWeatherJson(it) }
+        )
+    }
+    var isWeatherLoading by remember { mutableStateOf(false) }
+
     var isAnimating by remember { mutableStateOf(false) }
 
-    // Опрашиваем датчик света ТОЛЬКО если включен АВТО-режим яркости или открыт виджет питания
-    val shouldPollLight = brightnessMode == BrightnessMode.AUTO || rightWidget == RightWidget.BATTERY_INFO
+    // Фоновое обновление погоды для г. Павлово (Нижегородская обл.) раз в 30 минут
+    LaunchedEffect(Unit) {
+        while (true) {
+            isWeatherLoading = true
+            val rawJson = fetchPavlovoWeatherRawJson()
+            if (rawJson != null) {
+                prefs.edit().putString("cached_weather_json", rawJson).apply()
+                parseWeatherJson(rawJson)?.let { weatherData = it }
+            }
+            isWeatherLoading = false
+            delay(30 * 60_000L)
+        }
+    }
+
+    // Опрос датчика света только при включенном АВТО-режиме яркости
+    val shouldPollLight = brightnessMode == BrightnessMode.AUTO
     LaunchedEffect(shouldPollLight) {
         if (shouldPollLight) {
             while (true) {
                 onPollLightSensor()
-                delay(30_000L) // Раз в 30 секунд вместо 10
+                delay(30_000L)
             }
         }
     }
 
-    // Автоматический перевод экрана на минимально доступную частоту обновления
+    // Управление частотой экрана: 1 Гц в покое, 30 Гц во время анимации переключения
     LaunchedEffect(isAnimating) {
         val activity = context as? Activity ?: return@LaunchedEffect
         val window = activity.window
@@ -374,8 +420,7 @@ fun StandByScreen(
         window.attributes = params
     }
 
-    // Включаем 30 Гц только на 700 мс во время crossfade-перехода стилей, затем сбрасываем в покой
-    LaunchedEffect(clockStyle, calendarStyle, themeIndex) {
+    LaunchedEffect(clockStyle, rightPanelMode, themeIndex) {
         isAnimating = true
         delay(700L)
         isAnimating = false
@@ -386,9 +431,8 @@ fun StandByScreen(
             if (event == Lifecycle.Event.ON_PAUSE) {
                 prefs.edit()
                     .putInt("clock_style", clockStyle.ordinal)
-                    .putInt("calendar_style", calendarStyle.ordinal)
+                    .putInt("right_panel_mode", rightPanelMode.ordinal)
                     .putBoolean("auto_cycle_oled", autoCycleOled)
-                    .putInt("right_widget", rightWidget.ordinal)
                     .putInt("brightness_mode", brightnessMode.ordinal)
                     .putInt("theme_index", themeIndex)
                     .putBoolean("show_fps", showFps)
@@ -436,7 +480,7 @@ fun StandByScreen(
         label = "accentColor"
     )
 
-    // Точный минутный цикл: просыпается ровно в 00 секунд каждой новой минуты (1 раз в минуту вместо 60)
+    // Минутный цикл: обновление времени, сдвиг от выгорания и ротация календарей с погодой
     LaunchedEffect(autoCycleOled) {
         var minutesCounter = 0
         while (true) {
@@ -453,8 +497,9 @@ fun StandByScreen(
                     val otherClocks = DigitalClockStyle.entries.filter { it != clockStyle }
                     clockStyle = otherClocks.random()
 
-                    calendarStyle = CalendarLayoutStyle.entries[
-                        (calendarStyle.ordinal + 1) % CalendarLayoutStyle.entries.size
+                    swipeDirection = 1
+                    rightPanelMode = RightPanelMode.entries[
+                        (rightPanelMode.ordinal + 1) % RightPanelMode.entries.size
                     ]
                 }
             }
@@ -484,10 +529,43 @@ fun StandByScreen(
         }
     }
 
+    var verticalDragSum by remember { mutableFloatStateOf(0f) }
+    var swipeHandledInGesture by remember { mutableStateOf(false) }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF000000))
+            .pointerInput(Unit) {
+                detectVerticalDragGestures(
+                    onDragStart = {
+                        verticalDragSum = 0f
+                        swipeHandledInGesture = false
+                    },
+                    onVerticalDrag = { change, dragAmount ->
+                        change.consume()
+                        if (!swipeHandledInGesture) {
+                            verticalDragSum += dragAmount
+                            if (verticalDragSum < -55f) {
+                                // Свайп вверх -> следующий режим (календарь / погода)
+                                swipeHandledInGesture = true
+                                swipeDirection = 1
+                                rightPanelMode = RightPanelMode.entries[
+                                    (rightPanelMode.ordinal + 1) % RightPanelMode.entries.size
+                                ]
+                            } else if (verticalDragSum > 55f) {
+                                // Свайп вниз -> предыдущий режим (календарь / погода)
+                                swipeHandledInGesture = true
+                                swipeDirection = -1
+                                val size = RightPanelMode.entries.size
+                                rightPanelMode = RightPanelMode.entries[
+                                    (rightPanelMode.ordinal - 1 + size) % size
+                                ]
+                            }
+                        }
+                    }
+                )
+            }
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null
@@ -514,13 +592,26 @@ fun StandByScreen(
                     .fillMaxHeight()
             )
             WidgetContainer(
-                rightWidget = rightWidget,
-                calendarStyle = calendarStyle,
+                rightPanelMode = rightPanelMode,
+                swipeDirection = swipeDirection,
                 currentDate = currentDate,
                 batteryPct = batteryPct,
                 isCharging = isCharging,
-                ambientLux = if (rightWidget == RightWidget.BATTERY_INFO) ambientLux else 0f,
-                targetBrightnessPct = (targetBrightness * 100).toInt(),
+                weatherData = weatherData,
+                isWeatherLoading = isWeatherLoading,
+                onRefreshWeather = {
+                    if (!isWeatherLoading) {
+                        coroutineScope.launch {
+                            isWeatherLoading = true
+                            val rawJson = fetchPavlovoWeatherRawJson()
+                            if (rawJson != null) {
+                                prefs.edit().putString("cached_weather_json", rawJson).apply()
+                                parseWeatherJson(rawJson)?.let { weatherData = it }
+                            }
+                            isWeatherLoading = false
+                        }
+                    }
+                },
                 primaryColor = primaryColor,
                 accentColor = accentColor,
                 modifier = Modifier
@@ -559,13 +650,14 @@ fun StandByScreen(
                 }
 
                 TextButton(onClick = {
-                    calendarStyle = CalendarLayoutStyle.entries[
-                        (calendarStyle.ordinal + 1) % CalendarLayoutStyle.entries.size
+                    swipeDirection = 1
+                    rightPanelMode = RightPanelMode.entries[
+                        (rightPanelMode.ordinal + 1) % RightPanelMode.entries.size
                     ]
                 }) {
-                    Icon(Icons.Default.CalendarMonth, contentDescription = null, tint = Color.White)
+                    Icon(Icons.Default.Widgets, contentDescription = null, tint = Color.White)
                     Spacer(Modifier.width(5.dp))
-                    Text("Календарь: ${calendarStyle.title}", color = Color.White, fontSize = 12.sp)
+                    Text("Панель: ${rightPanelMode.title}", color = Color.White, fontSize = 12.sp)
                 }
 
                 TextButton(onClick = { autoCycleOled = !autoCycleOled }) {
@@ -576,7 +668,7 @@ fun StandByScreen(
                     )
                     Spacer(Modifier.width(4.dp))
                     Text(
-                        if (autoCycleOled) "OLED-защита: ВКЛ" else "OLED-защита: ВЫКЛ",
+                        if (autoCycleOled) "Ротация: ВКЛ" else "Ротация: ВЫКЛ",
                         color = if (autoCycleOled) accentColor else Color.LightGray,
                         fontSize = 12.sp
                     )
@@ -604,16 +696,6 @@ fun StandByScreen(
                     )
                 }
 
-                TextButton(onClick = {
-                    rightWidget = RightWidget.entries[
-                        (rightWidget.ordinal + 1) % RightWidget.entries.size
-                    ]
-                }) {
-                    Icon(Icons.Default.Widgets, contentDescription = null, tint = Color.White)
-                    Spacer(Modifier.width(5.dp))
-                    Text("Виджет: ${rightWidget.title}", color = Color.White, fontSize = 12.sp)
-                }
-
                 TextButton(onClick = { showFps = !showFps }) {
                     Icon(
                         Icons.Default.Speed,
@@ -639,11 +721,8 @@ fun StandByScreen(
         }
     }
 }
-
 /**
  * Пассивный измеритель FPS через OnFrameMetricsAvailableListener.
- * В отличие от Choreographer.postFrameCallback, НЕ принуждает систему рисовать 60 кадров в секунду,
- * а считает только реально отрисованные кадры приложения (в покое показывает 0–1 FPS).
  */
 @Composable
 fun FpsMeter(modifier: Modifier = Modifier) {
@@ -675,7 +754,6 @@ fun FpsMeter(modifier: Modifier = Modifier) {
         while (true) {
             delay(1000L)
             val count = renderedFrames.getAndSet(0)
-            // Не учитываем 1 кадр, если он был вызван самим обновлением текста счетчика
             val actualFps = if (count <= 1) 1 else count
             if (fps != actualFps) {
                 fps = actualFps
@@ -732,13 +810,14 @@ fun ClockContainer(
 
 @Composable
 fun WidgetContainer(
-    rightWidget: RightWidget,
-    calendarStyle: CalendarLayoutStyle,
+    rightPanelMode: RightPanelMode,
+    swipeDirection: Int,
     currentDate: LocalDate,
     batteryPct: Int,
     isCharging: Boolean,
-    ambientLux: Float,
-    targetBrightnessPct: Int,
+    weatherData: WeatherData?,
+    isWeatherLoading: Boolean,
+    onRefreshWeather: () -> Unit,
     primaryColor: Color,
     accentColor: Color,
     modifier: Modifier = Modifier
@@ -749,43 +828,51 @@ fun WidgetContainer(
             .padding(16.dp),
         contentAlignment = Alignment.Center
     ) {
-        when (rightWidget) {
-            RightWidget.CALENDAR -> {
-                AnimatedContent(
-                    targetState = calendarStyle,
-                    transitionSpec = {
-                        fadeIn(animationSpec = tween(600)) togetherWith
-                                fadeOut(animationSpec = tween(600))
-                    },
-                    label = "CalendarStyleCrossfade"
-                ) { style ->
-                    when (style) {
-                        CalendarLayoutStyle.LAYOUT_TOP -> CalendarLayoutTopView(
-                            date = currentDate,
-                            batteryPct = batteryPct,
-                            isCharging = isCharging,
-                            primaryColor = primaryColor,
-                            accentColor = accentColor
-                        )
-                        CalendarLayoutStyle.LAYOUT_BOTTOM -> CalendarLayoutBottomView(
-                            date = currentDate,
-                            batteryPct = batteryPct,
-                            isCharging = isCharging,
-                            primaryColor = primaryColor,
-                            accentColor = accentColor
-                        )
-                    }
-                }
+        AnimatedContent(
+            targetState = rightPanelMode,
+            transitionSpec = {
+                val dir = if (swipeDirection >= 0) 1 else -1
+                (slideInVertically(animationSpec = tween(550)) { height -> dir * height / 3 } +
+                        fadeIn(animationSpec = tween(550))) togetherWith
+                        (slideOutVertically(animationSpec = tween(550)) { height -> -dir * height / 3 } +
+                                fadeOut(animationSpec = tween(550)))
+            },
+            label = "RightPanelCrossfade"
+        ) { mode ->
+            when (mode) {
+                RightPanelMode.CALENDAR_TOP -> CalendarLayoutTopView(
+                    date = currentDate,
+                    batteryPct = batteryPct,
+                    isCharging = isCharging,
+                    primaryColor = primaryColor,
+                    accentColor = accentColor
+                )
+                RightPanelMode.WEATHER_CURRENT -> WeatherCurrentDetailedView(
+                    weather = weatherData,
+                    isLoading = isWeatherLoading,
+                    onRefresh = onRefreshWeather,
+                    batteryPct = batteryPct,
+                    isCharging = isCharging,
+                    primaryColor = primaryColor,
+                    accentColor = accentColor
+                )
+                RightPanelMode.CALENDAR_BOTTOM -> CalendarLayoutBottomView(
+                    date = currentDate,
+                    batteryPct = batteryPct,
+                    isCharging = isCharging,
+                    primaryColor = primaryColor,
+                    accentColor = accentColor
+                )
+                RightPanelMode.WEATHER_FORECAST -> WeatherForecastGridView(
+                    weather = weatherData,
+                    isLoading = isWeatherLoading,
+                    onRefresh = onRefreshWeather,
+                    batteryPct = batteryPct,
+                    isCharging = isCharging,
+                    primaryColor = primaryColor,
+                    accentColor = accentColor
+                )
             }
-            RightWidget.POMODORO_TIMER -> TimerWidgetView(primaryColor = primaryColor, accentColor = accentColor)
-            RightWidget.BATTERY_INFO -> BatteryWidgetView(
-                batteryPct = batteryPct,
-                isCharging = isCharging,
-                ambientLux = ambientLux,
-                targetBrightnessPct = targetBrightnessPct,
-                primaryColor = primaryColor,
-                accentColor = accentColor
-            )
         }
     }
 }
@@ -917,6 +1004,408 @@ fun MonthGridWidget(
                 }
             }
         }
+    }
+}
+
+/**
+ * Виджет погоды №1: Крупная текущая погода в г. Павлово с подробными параметрами
+ * (ощущается как, ветер, влажность, давление в мм рт. ст.).
+ */
+@Composable
+fun WeatherCurrentDetailedView(
+    weather: WeatherData?,
+    isLoading: Boolean,
+    onRefresh: () -> Unit,
+    batteryPct: Int,
+    isCharging: Boolean,
+    primaryColor: Color,
+    accentColor: Color
+) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        verticalArrangement = Arrangement.SpaceBetween
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Top
+        ) {
+            Column(
+                modifier = Modifier.clickable { onRefresh() }
+            ) {
+                Text(
+                    text = "ПАВЛОВО",
+                    color = accentColor,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.5.sp
+                )
+                Text(
+                    text = if (isLoading && weather == null) "Загрузка..." else weatherConditionText(weather?.weatherCode ?: 0),
+                    color = primaryColor.copy(alpha = 0.85f),
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            BatteryBadge(batteryPct, isCharging, primaryColor, accentColor)
+        }
+
+        if (weather == null) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = if (isLoading) "Обновление погоды..." else "Нет данных • Нажмите для повтора",
+                    color = primaryColor.copy(alpha = 0.6f),
+                    fontSize = 14.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.clickable { onRefresh() }
+                )
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Icon(
+                        imageVector = weatherConditionIcon(weather.weatherCode),
+                        contentDescription = null,
+                        tint = accentColor,
+                        modifier = Modifier.size(60.dp)
+                    )
+                    Text(
+                        text = formatTemp(weather.temp),
+                        color = primaryColor,
+                        fontSize = 68.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = (-2).sp
+                    )
+                }
+
+                Column(horizontalAlignment = Alignment.End) {
+                    Text(
+                        text = "ОЩУЩАЕТСЯ",
+                        color = primaryColor.copy(alpha = 0.45f),
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.sp
+                    )
+                    Text(
+                        text = formatTemp(weather.feelsLike),
+                        color = accentColor,
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    val today = weather.daily.firstOrNull()
+                    if (today != null) {
+                        Text(
+                            text = "Днем ${formatTemp(today.maxTemp)} • Ночью ${formatTemp(today.minTemp)}",
+                            color = primaryColor.copy(alpha = 0.6f),
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, primaryColor.copy(alpha = 0.18f), RoundedCornerShape(16.dp))
+                    .padding(vertical = 10.dp, horizontal = 14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                WeatherMetricItem("ВЕТЕР", "${weather.windSpeed} м/с", primaryColor, accentColor)
+                WeatherMetricItem("ВЛАЖНОСТЬ", "${weather.humidity}%", primaryColor, accentColor)
+                WeatherMetricItem("ДАВЛЕНИЕ", "${weather.pressureMmHg} мм", primaryColor, accentColor)
+            }
+        }
+    }
+}
+
+@Composable
+fun WeatherMetricItem(
+    label: String,
+    value: String,
+    primaryColor: Color,
+    accentColor: Color
+) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            text = label,
+            color = primaryColor.copy(alpha = 0.45f),
+            fontSize = 9.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.sp
+        )
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(
+            text = value,
+            color = primaryColor,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+}
+
+/**
+ * Виджет погоды №2: Прогноз на 4 дня по г. Павлово в виде карточек + компактная сводка сверху.
+ */
+@Composable
+fun WeatherForecastGridView(
+    weather: WeatherData?,
+    isLoading: Boolean,
+    onRefresh: () -> Unit,
+    batteryPct: Int,
+    isCharging: Boolean,
+    primaryColor: Color,
+    accentColor: Color
+) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        verticalArrangement = Arrangement.SpaceBetween
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Top
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.clickable { onRefresh() }
+            ) {
+                Icon(
+                    imageVector = weatherConditionIcon(weather?.weatherCode ?: 0),
+                    contentDescription = null,
+                    tint = accentColor,
+                    modifier = Modifier.size(32.dp)
+                )
+                Column {
+                    Text(
+                        text = "ПРОГНОЗ • ПАВЛОВО",
+                        color = accentColor,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.2.sp
+                    )
+                    Text(
+                        text = if (weather != null) {
+                            "Сейчас ${formatTemp(weather.temp)} • ${weatherConditionText(weather.weatherCode)}"
+                        } else {
+                            "Загрузка прогноза..."
+                        },
+                        color = primaryColor,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+            BatteryBadge(batteryPct, isCharging, primaryColor, accentColor)
+        }
+
+        if (weather == null || weather.daily.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = if (isLoading) "Загрузка прогноза..." else "Нажмите для обновления прогноза",
+                    color = primaryColor.copy(alpha = 0.6f),
+                    fontSize = 14.sp,
+                    modifier = Modifier.clickable { onRefresh() }
+                )
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                weather.daily.take(4).forEachIndexed { index, day ->
+                    val isToday = index == 0
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .border(
+                                width = if (isToday) 1.5.dp else 1.dp,
+                                color = if (isToday) accentColor.copy(alpha = 0.75f) else primaryColor.copy(alpha = 0.18f),
+                                shape = RoundedCornerShape(16.dp)
+                            )
+                            .padding(vertical = 10.dp, horizontal = 6.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        Text(
+                            text = if (isToday) "СЕГОДНЯ" else day.dayName,
+                            color = if (isToday) accentColor else primaryColor.copy(alpha = 0.75f),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = day.dateShort,
+                            color = primaryColor.copy(alpha = 0.45f),
+                            fontSize = 9.sp
+                        )
+                        Icon(
+                            imageVector = weatherConditionIcon(day.weatherCode),
+                            contentDescription = null,
+                            tint = if (isToday) accentColor else primaryColor,
+                            modifier = Modifier.size(26.dp)
+                        )
+                        Text(
+                            text = formatTemp(day.maxTemp),
+                            color = primaryColor,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = formatTemp(day.minTemp),
+                            color = primaryColor.copy(alpha = 0.5f),
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.Bottom
+            ) {
+                Text(
+                    text = "Свайп вверх/вниз — смена виджета",
+                    color = primaryColor.copy(alpha = 0.35f),
+                    fontSize = 10.sp
+                )
+                Text(
+                    text = "Обновлено ${weather.updatedTime}",
+                    color = primaryColor.copy(alpha = 0.45f),
+                    fontSize = 10.sp
+                )
+            }
+        }
+    }
+}
+
+private fun formatTemp(temp: Int): String = if (temp > 0) "+$temp°" else "$temp°"
+
+private fun weatherConditionText(code: Int): String = when (code) {
+    0 -> "Ясно"
+    1 -> "Преим. ясно"
+    2 -> "Переменная облачность"
+    3 -> "Пасмурно"
+    45, 48 -> "Туман"
+    51, 53, 55, 56, 57 -> "Морось"
+    61, 63, 65, 66, 67 -> "Дождь"
+    71, 73, 75, 77 -> "Снег"
+    80, 81, 82 -> "Ливень"
+    85, 86 -> "Снегопад"
+    95, 96, 99 -> "Гроза"
+    else -> "Облачно"
+}
+
+private fun weatherConditionIcon(code: Int): ImageVector = when (code) {
+    0, 1 -> Icons.Default.WbSunny
+    2, 3 -> Icons.Default.Cloud
+    45, 48 -> Icons.Default.Dehaze
+    51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82 -> Icons.Default.Grain
+    71, 73, 75, 77, 85, 86 -> Icons.Default.AcUnit
+    95, 96, 99 -> Icons.Default.Thunderstorm
+    else -> Icons.Default.CloudQueue
+}
+
+/**
+ * Запрашивает погоду напрямую по координатам г. Павлово (Нижегородская область):
+ * 55.9619° N, 43.0900° E. Не зависит от страны VPN.
+ */
+private suspend fun fetchPavlovoWeatherRawJson(): String? = withContext(Dispatchers.IO) {
+    var connection: HttpURLConnection? = null
+    try {
+        val url = URL(
+            "https://api.open-meteo.com/v1/forecast" +
+                    "?latitude=55.9619&longitude=43.0900" +
+                    "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,surface_pressure,wind_speed_10m" +
+                    "&daily=weather_code,temperature_2m_max,temperature_2m_min" +
+                    "&wind_speed_unit=ms" +
+                    "&timezone=Europe%2FMoscow" +
+                    "&forecast_days=4"
+        )
+        connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 8000
+            readTimeout = 8000
+            setRequestProperty("Accept", "application/json")
+        }
+        if (connection.responseCode == HttpURLConnection.HTTP_OK) {
+            connection.inputStream.bufferedReader().use { it.readText() }
+        } else null
+    } catch (_: Exception) {
+        null
+    } finally {
+        connection?.disconnect()
+    }
+}
+
+private fun parseWeatherJson(rawJson: String): WeatherData? {
+    return try {
+        val root = JSONObject(rawJson)
+        val current = root.getJSONObject("current")
+        val temp = current.optDouble("temperature_2m", 0.0).roundToInt()
+        val feelsLike = current.optDouble("apparent_temperature", 0.0).roundToInt()
+        val weatherCode = current.optInt("weather_code", 0)
+        val humidity = current.optInt("relative_humidity_2m", 0)
+        val windSpeed = current.optDouble("wind_speed_10m", 0.0).roundToInt()
+        val pressureHpa = current.optDouble("surface_pressure", 1013.25)
+        val pressureMmHg = (pressureHpa * 0.750062).roundToInt()
+
+        val dailyObj = root.getJSONObject("daily")
+        val times = dailyObj.getJSONArray("time")
+        val codes = dailyObj.getJSONArray("weather_code")
+        val maxTemps = dailyObj.getJSONArray("temperature_2m_max")
+        val minTemps = dailyObj.getJSONArray("temperature_2m_min")
+
+        val ruLocale = Locale("ru", "RU")
+        val dailyList = mutableListOf<DayForecast>()
+        val count = minOf(4, times.length())
+        for (i in 0 until count) {
+            val dateStr = times.getString(i)
+            val parsedDate = LocalDate.parse(dateStr)
+            val dayName = parsedDate.dayOfWeek.getDisplayName(TextStyle.SHORT, ruLocale).uppercase(ruLocale)
+            val dateShort = String.format("%02d.%02d", parsedDate.dayOfMonth, parsedDate.monthValue)
+            dailyList.add(
+                DayForecast(
+                    dayName = dayName,
+                    dateShort = dateShort,
+                    maxTemp = maxTemps.optDouble(i, 0.0).roundToInt(),
+                    minTemp = minTemps.optDouble(i, 0.0).roundToInt(),
+                    weatherCode = codes.optInt(i, 0)
+                )
+            )
+        }
+
+        val updatedTime = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm"))
+        WeatherData(
+            temp = temp,
+            feelsLike = feelsLike,
+            weatherCode = weatherCode,
+            humidity = humidity,
+            windSpeed = windSpeed,
+            pressureMmHg = pressureMmHg,
+            daily = dailyList,
+            updatedTime = updatedTime
+        )
+    } catch (_: Exception) {
+        null
     }
 }
 
@@ -1093,99 +1582,6 @@ fun BatteryBadge(
             color = primaryColor,
             fontSize = 13.sp,
             fontWeight = FontWeight.Bold
-        )
-    }
-}
-
-@Composable
-fun TimerWidgetView(primaryColor: Color, accentColor: Color) {
-    var remainingSeconds by remember { mutableIntStateOf(25 * 60) }
-    var isRunning by remember { mutableStateOf(false) }
-
-    LaunchedEffect(isRunning) {
-        while (isRunning && remainingSeconds > 0) {
-            delay(1000L)
-            remainingSeconds--
-        }
-        if (remainingSeconds == 0) isRunning = false
-    }
-
-    val mins = remainingSeconds / 60
-    val secs = remainingSeconds % 60
-
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.SpaceEvenly
-    ) {
-        Text(
-            text = "ФОКУС-ТАЙМЕР",
-            color = accentColor,
-            fontSize = 16.sp,
-            fontWeight = FontWeight.Bold,
-            letterSpacing = 2.sp
-        )
-        Text(
-            text = String.format("%02d:%02d", mins, secs),
-            color = primaryColor,
-            fontSize = 60.sp,
-            fontWeight = FontWeight.Light
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            OutlinedButton(onClick = { isRunning = !isRunning }) {
-                Text(
-                    if (isRunning) "Пауза" else "Старт",
-                    color = accentColor,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-            OutlinedButton(onClick = {
-                isRunning = false
-                remainingSeconds = 25 * 60
-            }) {
-                Text("Сброс", color = primaryColor)
-            }
-        }
-    }
-}
-
-@Composable
-fun BatteryWidgetView(
-    batteryPct: Int,
-    isCharging: Boolean,
-    ambientLux: Float,
-    targetBrightnessPct: Int,
-    primaryColor: Color,
-    accentColor: Color
-) {
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.SpaceEvenly
-    ) {
-        Icon(
-            imageVector = if (isCharging) Icons.Default.BatteryChargingFull else Icons.Default.BatteryStd,
-            contentDescription = null,
-            tint = accentColor,
-            modifier = Modifier.size(52.dp)
-        )
-        Text(
-            text = "$batteryPct%",
-            color = primaryColor,
-            fontSize = 58.sp,
-            fontWeight = FontWeight.Light
-        )
-        Text(
-            text = if (isCharging) "ИДЕТ ЗАРЯДКА • STANDBY" else "РАБОТА ОТ БАТАРЕИ",
-            color = primaryColor.copy(alpha = 0.7f),
-            fontSize = 13.sp,
-            fontWeight = FontWeight.SemiBold,
-            textAlign = TextAlign.Center
-        )
-        Text(
-            text = "Свет: ${ambientLux.toInt()} лк • Яркость: $targetBrightnessPct%",
-            color = primaryColor.copy(alpha = 0.5f),
-            fontSize = 12.sp
         )
     }
 }
