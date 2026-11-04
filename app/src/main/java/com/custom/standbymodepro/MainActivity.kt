@@ -128,7 +128,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     ambientLux = currentLux,
                     onRequestOverlayPermission = {
                         try {
-                            if (!Settings.canDrawOverlays(this)) {
+                            // Важно: this@MainActivity, а не просто this (иначе BoxScope)
+                            if (!Settings.canDrawOverlays(this@MainActivity)) {
                                 val intent = Intent(
                                     Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                                     Uri.parse("package:$packageName")
@@ -173,7 +174,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         portraitEnterTime = 0L
         lastAccelProcessTime = 0L
         window.decorView.post { hideSystemUI() }
-        // Свет — нормальная частота, акселерометр — тоже, но с фильтрацией внутри
         lightSensor?.let {
             sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
         }
@@ -202,7 +202,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             }
             Sensor.TYPE_ACCELEROMETER -> {
                 val now = System.currentTimeMillis()
-                // Обрабатываем акселерометр не чаще раза в 400 мс — экономия CPU
                 if (now - lastAccelProcessTime < 400L) return
                 lastAccelProcessTime = now
 
@@ -291,7 +290,6 @@ fun StandByScreen(
     var batteryPct by remember { mutableIntStateOf(100) }
     var isCharging by remember { mutableStateOf(false) }
 
-    // Яркость: ночь 5%, день 10%
     val isNight = when (brightnessMode) {
         BrightnessMode.AUTO -> ambientLux < 8f
         BrightnessMode.DAY_10 -> false
@@ -319,12 +317,10 @@ fun StandByScreen(
         label = "accentColor"
     )
 
-    // Обновление времени + burn-in + батарея
     LaunchedEffect(autoCycleOled) {
         var lastMinute = -1
         var minutesCounter = 0
 
-        // Один раз получаем стартовое значение батареи
         try {
             val bm = context.registerReceiver(null, IntentFilter(ACTION_BATTERY_CHANGED))
             val level = bm?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
@@ -346,7 +342,6 @@ fun StandByScreen(
                 lastMinute = now.minute
                 minutesCounter++
 
-                // Меньший сдвиг — меньше нагрузка + всё ещё защита OLED
                 burnInOffsetX = Random.nextInt(-12, 13)
                 burnInOffsetY = Random.nextInt(-10, 11)
 
@@ -364,7 +359,6 @@ fun StandByScreen(
                     }
                 }
 
-                // Обновляем батарею раз в минуту (sticky broadcast — дёшево)
                 try {
                     val bm = context.registerReceiver(null, IntentFilter(ACTION_BATTERY_CHANGED))
                     val level = bm?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
@@ -725,10 +719,11 @@ fun CalendarLayoutSplitView(
             BatteryBadge(batteryPct, isCharging, primaryColor, accentColor)
         }
 
+        // Исправлено: правильные параметры Row
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterVertically,
-            verticalArrangement = Arrangement.Center
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically
         ) {
             Column(
                 modifier = Modifier.weight(0.4f),
