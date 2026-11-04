@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
+import androidx.core.content.ContextCompat
 import kotlin.math.abs
 
 class StandByService : Service(), SensorEventListener {
@@ -30,26 +31,30 @@ class StandByService : Service(), SensorEventListener {
     private var isMonitoring = false
     private var landscapeEnterTime = 0L
     private var standbyLaunchedInCurrentCycle = false
-    private var lastSensorEventTime = 0L
 
-    // Более редкий опрос акселерометра (≈ 2 раза в секунду вместо 5)
-    private val SENSOR_SAMPLING_US = 500_000  // 500 мс
-
-    private val screenReceiver = object : BroadcastReceiver() {
+    private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 Intent.ACTION_SCREEN_OFF -> {
                     standbyLaunchedInCurrentCycle = false
-                    startSensorMonitoring()
+                    if (!isActivityActive) startSensorMonitoring()
                 }
                 Intent.ACTION_USER_PRESENT -> {
                     stopSensorMonitoring()
                 }
                 Intent.ACTION_SCREEN_ON -> {
-                    if (keyguardManager?.isKeyguardLocked == true) {
+                    if (keyguardManager?.isKeyguardLocked == true && !isActivityActive) {
                         startSensorMonitoring()
-                    } else {
-                        stopSensorMonitoring()
+                    }
+                }
+                ACTION_ACTIVITY_RESUMED -> {
+                    isActivityActive = true
+                    stopSensorMonitoring()
+                }
+                ACTION_ACTIVITY_PAUSED -> {
+                    isActivityActive = false
+                    if (powerManager?.isInteractive == false || keyguardManager?.isKeyguardLocked == true) {
+                        startSensorMonitoring()
                     }
                 }
             }
@@ -69,11 +74,17 @@ class StandByService : Service(), SensorEventListener {
             addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_USER_PRESENT)
+            addAction(ACTION_ACTIVITY_RESUMED)
+            addAction(ACTION_ACTIVITY_PAUSED)
         }
-        registerReceiver(screenReceiver, filter)
+        ContextCompat.registerReceiver(
+            this,
+            stateReceiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
 
-        // Запускаем мониторинг только если экран выключен или заблокирован
-        if (powerManager?.isInteractive == false || keyguardManager?.isKeyguardLocked == true) {
+        if ((powerManager?.isInteractive == false || keyguardManager?.isKeyguardLocked == true) && !isActivityActive) {
             startSensorMonitoring()
         }
     }
@@ -86,7 +97,7 @@ class StandByService : Service(), SensorEventListener {
                 "StandBy AOD Автозапуск",
                 NotificationManager.IMPORTANCE_MIN
             ).apply {
-                description = "Отслеживает горизонтальный поворот в режиме AOD"
+                description = "Отслеживает горизонтальный поворот в режиме блокировки"
                 setShowBadge(false)
             }
             val nm = getSystemService(NotificationManager::class.java)
@@ -102,7 +113,7 @@ class StandByService : Service(), SensorEventListener {
 
         val notification = builder
             .setContentTitle("StandBy Mode Pro активен")
-            .setContentText("Поверните выключенный телефон горизонтально для запуска")
+            .setContentText("Поверните заблокированный телефон горизонтально")
             .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
             .build()
 
@@ -110,12 +121,10 @@ class StandByService : Service(), SensorEventListener {
     }
 
     private fun startSensorMonitoring() {
-        if (isMonitoring) return
+        if (isMonitoring || isActivityActive) return
         isMonitoring = true
         landscapeEnterTime = 0L
-        lastSensorEventTime = System.currentTimeMillis()
 
-        // Короткий WakeLock (40 минут). Если мониторинг всё ещё нужен — перезапросим.
         if (wakeLock == null) {
             wakeLock = powerManager?.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
@@ -123,11 +132,12 @@ class StandByService : Service(), SensorEventListener {
             )
         }
         if (wakeLock?.isHeld == false) {
-            wakeLock?.acquire(40 * 60 * 1000L) // 40 минут вместо 12 часов
+            wakeLock?.acquire(6 * 60 * 60 * 1000L)
         }
 
+        // Редкий опрос (раз в 800 мс) + аппаратный буфер (1.6 сек) для минимального расхода АКБ
         accelerometer?.let {
-            sensorManager?.registerListener(this, it, SENSOR_SAMPLING_US)
+            sensorManager?.registerListener(this, it, 800_000, 1_600_000)
         }
     }
 
@@ -135,7 +145,6 @@ class StandByService : Service(), SensorEventListener {
         if (!isMonitoring) return
         isMonitoring = false
         sensorManager?.unregisterListener(this)
-
         if (wakeLock?.isHeld == true) {
             try {
                 wakeLock?.release()
@@ -146,25 +155,22 @@ class StandByService : Service(), SensorEventListener {
     override fun onSensorChanged(event: SensorEvent?) {
         if (event?.sensor?.type != Sensor.TYPE_ACCELEROMETER) return
 
-        val now = System.currentTimeMillis()
-        // Дополнительная защита от слишком частых событий
-        if (now - lastSensorEventTime < 400) return
-        lastSensorEventTime = now
-
         val x = event.values[0]
         val y = event.values[1]
         val z = event.values[2]
 
-        // Чуть мягче пороги — лучше работает в подставках
-        val isLandscape = abs(x) > 6.2f && abs(y) < 4.8f && abs(z) < 8.0f
+        val isLandscape = abs(x) > 7.0f && abs(y) < 4.0f && abs(z) < 7.5f
         val isPortrait = abs(y) > 6.5f && abs(x) < 4.5f
+
+        val now = System.currentTimeMillis()
 
         if (isLandscape) {
             if (landscapeEnterTime == 0L) {
                 landscapeEnterTime = now
-            } else if (now - landscapeEnterTime > 800L && !standbyLaunchedInCurrentCycle) {
+            } else if (now - landscapeEnterTime > 700L && !standbyLaunchedInCurrentCycle) {
                 if (Settings.canDrawOverlays(this)) {
                     standbyLaunchedInCurrentCycle = true
+                    stopSensorMonitoring()
                     wakeUpAndLaunchStandBy()
                 }
             }
@@ -200,17 +206,22 @@ class StandByService : Service(), SensorEventListener {
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return START_STICKY
-    }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
         super.onDestroy()
         stopSensorMonitoring()
         try {
-            unregisterReceiver(screenReceiver)
+            unregisterReceiver(stateReceiver)
         } catch (_: Exception) {}
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    companion object {
+        const val ACTION_ACTIVITY_RESUMED = "com.custom.standbymodepro.ACTIVITY_RESUMED"
+        const val ACTION_ACTIVITY_PAUSED = "com.custom.standbymodepro.ACTIVITY_PAUSED"
+        @Volatile
+        var isActivityActive = false
+    }
 }
