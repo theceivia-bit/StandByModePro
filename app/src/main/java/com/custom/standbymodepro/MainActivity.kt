@@ -4,8 +4,8 @@ import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.Intent.ACTION_BATTERY_CHANGED
+import android.content.IntentFilter
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -14,9 +14,12 @@ import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
-import android.view.Choreographer
+import android.view.FrameMetrics
 import android.view.View
+import android.view.Window
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
@@ -64,6 +67,7 @@ import java.time.LocalTime
 import java.time.YearMonth
 import java.time.format.TextStyle
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.math.abs
 import kotlin.random.Random
@@ -125,35 +129,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         } catch (_: Exception) {}
 
         setContent {
-            // Импульсный опрос датчика освещения 1 раз в 10 секунд
-            LaunchedEffect(Unit) {
-                val sm = sensorManager
-                val ls = lightSensor
-                if (sm != null && ls != null) {
-                    while (true) {
-                        val sampledLux = withTimeoutOrNull(1500L) {
-                            suspendCancellableCoroutine<Float> { cont ->
-                                val listener = object : SensorEventListener {
-                                    override fun onSensorChanged(event: SensorEvent?) {
-                                        if (event != null && event.values.isNotEmpty()) {
-                                            sm.unregisterListener(this)
-                                            if (cont.isActive) cont.resume(event.values[0])
-                                        }
-                                    }
-                                    override fun onAccuracyChanged(s: Sensor?, a: Int) {}
-                                }
-                                sm.registerListener(listener, ls, SensorManager.SENSOR_DELAY_NORMAL)
-                                cont.invokeOnCancellation { sm.unregisterListener(listener) }
-                            }
-                        }
-                        if (sampledLux != null && abs(sampledLux - currentLux) >= 1f) {
-                            currentLux = sampledLux
-                        }
-                        delay(10_000L)
-                    }
-                }
-            }
-
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -161,6 +136,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             ) {
                 StandByScreen(
                     ambientLux = currentLux,
+                    onPollLightSensor = { pollLightSensorOnce() },
                     onRequestOverlayPermission = {
                         try {
                             if (!Settings.canDrawOverlays(this@MainActivity)) {
@@ -178,6 +154,33 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
         window.decorView.post {
             hideSystemUI()
+        }
+    }
+
+    private suspend fun pollLightSensorOnce() {
+        val sm = sensorManager ?: return
+        val ls = lightSensor ?: return
+        val sampledLux = withTimeoutOrNull(1500L) {
+            suspendCancellableCoroutine<Float> { cont ->
+                val listener = object : SensorEventListener {
+                    override fun onSensorChanged(event: SensorEvent?) {
+                        if (event != null && event.values.isNotEmpty()) {
+                            sm.unregisterListener(this)
+                            if (cont.isActive) cont.resume(event.values[0])
+                        }
+                    }
+                    override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+                }
+                sm.registerListener(listener, ls, SensorManager.SENSOR_DELAY_NORMAL)
+                cont.invokeOnCancellation { sm.unregisterListener(listener) }
+            }
+        }
+        if (sampledLux != null) {
+            // Гистерезис порога 8 лк + фильтр мелких колебаний, чтобы не будить UI лишней рекомпозицией
+            val crossedNightThreshold = (sampledLux < 8f) != (currentLux < 8f)
+            if (crossedNightThreshold || abs(sampledLux - currentLux) >= 5f) {
+                currentLux = sampledLux
+            }
         }
     }
 
@@ -210,8 +213,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sendBroadcast(Intent(StandByService.ACTION_ACTIVITY_RESUMED).setPackage(packageName))
         window.decorView.post { hideSystemUI() }
 
+        // Экономичный опрос раз в 1 секунду с аппаратным буфером 2 секунды для выхода при повороте в портрет
         accelerometer?.let {
-            sensorManager?.registerListener(this, it, 500_000, 1_000_000)
+            sensorManager?.registerListener(this, it, 1_000_000, 2_000_000)
         }
     }
 
@@ -241,7 +245,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             if (isPortrait) {
                 if (portraitEnterTime == 0L) {
                     portraitEnterTime = now
-                } else if (now - portraitEnterTime > 500L) {
+                } else if (now - portraitEnterTime > 400L) {
                     finish()
                 }
             } else {
@@ -297,6 +301,7 @@ private const val PREFS_NAME = "standby_mode_prefs"
 @Composable
 fun StandByScreen(
     ambientLux: Float,
+    onPollLightSensor: suspend () -> Unit,
     onRequestOverlayPermission: () -> Unit
 ) {
     val context = LocalContext.current
@@ -329,20 +334,51 @@ fun StandByScreen(
         mutableIntStateOf(prefs.getInt("theme_index", 0).coerceIn(0, colorThemes.lastIndex))
     }
     var showControls by remember { mutableStateOf(false) }
-    var showFps by remember { mutableStateOf(false) }
+    var showFps by remember { mutableStateOf(prefs.getBoolean("show_fps", false)) }
 
-    // Флаг активной анимации для переключения герцовки (1 Гц / 30 Гц)
+    // Флаг активной анимации: включается только при смене стилей или темы
     var isAnimating by remember { mutableStateOf(false) }
 
-    // Управление частотой обновления дисплея
-    LaunchedEffect(isAnimating) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            (context as? Activity)?.window?.let { window ->
-                val params = window.attributes
-                params.preferredRefreshRate = if (isAnimating) 30f else 1f
-                window.attributes = params
+    // Опрашиваем датчик света ТОЛЬКО если включен АВТО-режим яркости или открыт виджет питания
+    val shouldPollLight = brightnessMode == BrightnessMode.AUTO || rightWidget == RightWidget.BATTERY_INFO
+    LaunchedEffect(shouldPollLight) {
+        if (shouldPollLight) {
+            while (true) {
+                onPollLightSensor()
+                delay(30_000L) // Раз в 30 секунд вместо 10
             }
         }
+    }
+
+    // Автоматический перевод экрана на минимально доступную частоту обновления
+    LaunchedEffect(isAnimating) {
+        val activity = context as? Activity ?: return@LaunchedEffect
+        val window = activity.window
+        val params = window.attributes
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val modes = activity.display?.supportedModes
+            if (!modes.isNullOrEmpty()) {
+                val targetMode = if (isAnimating) {
+                    modes.filter { it.refreshRate <= 60.1f }.maxByOrNull { it.refreshRate }
+                        ?: modes.minByOrNull { it.refreshRate }
+                } else {
+                    modes.minByOrNull { it.refreshRate }
+                }
+                if (targetMode != null && params.preferredDisplayModeId != targetMode.modeId) {
+                    params.preferredDisplayModeId = targetMode.modeId
+                }
+            }
+        }
+        params.preferredRefreshRate = if (isAnimating) 30f else 1f
+        window.attributes = params
+    }
+
+    // Включаем 30 Гц только на 700 мс во время crossfade-перехода стилей, затем сбрасываем в покой
+    LaunchedEffect(clockStyle, calendarStyle, themeIndex) {
+        isAnimating = true
+        delay(700L)
+        isAnimating = false
     }
 
     DisposableEffect(lifecycleOwner) {
@@ -381,72 +417,63 @@ fun StandByScreen(
     LaunchedEffect(targetBrightness) {
         (context as? Activity)?.window?.let { win ->
             val params = win.attributes
-            params.screenBrightness = targetBrightness
-            win.attributes = params
+            if (params.screenBrightness != targetBrightness) {
+                params.screenBrightness = targetBrightness
+                win.attributes = params
+            }
         }
     }
 
     val currentTheme = colorThemes[themeIndex]
     val primaryColor by animateColorAsState(
         targetValue = currentTheme.primary,
-        animationSpec = tween(1000),
+        animationSpec = tween(500),
         label = "primaryColor"
     )
     val accentColor by animateColorAsState(
         targetValue = currentTheme.accent,
-        animationSpec = tween(1000),
+        animationSpec = tween(500),
         label = "accentColor"
     )
 
-    // Цикл смены минут: 30 Гц на 2.5 сек, потом обратно в 1 Гц
+    // Точный минутный цикл: просыпается ровно в 00 секунд каждой новой минуты (1 раз в минуту вместо 60)
     LaunchedEffect(autoCycleOled) {
-        var lastMinute = -1
         var minutesCounter = 0
         while (true) {
-            val now = LocalTime.now()
+            currentTime = LocalTime.now()
+            currentDate = LocalDate.now()
 
-            if (now.minute != lastMinute) {
-                val isFirstTick = lastMinute == -1
-                lastMinute = now.minute
-
-                isAnimating = true
-                currentTime = now
-                currentDate = LocalDate.now()
-
-                if (!isFirstTick) {
-                    minutesCounter++
-
-                    if (minutesCounter % 3 == 0) {
-                        burnInOffsetX = Random.nextInt(-18, 19)
-                        burnInOffsetY = Random.nextInt(-14, 15)
-                    }
-
-                    if (autoCycleOled && minutesCounter % 5 == 0) {
-                        val otherClocks = DigitalClockStyle.entries.filter { it != clockStyle }
-                        clockStyle = otherClocks.random()
-
-                        calendarStyle = CalendarLayoutStyle.entries[
-                            (calendarStyle.ordinal + 1) % CalendarLayoutStyle.entries.size
-                        ]
-                    }
+            if (minutesCounter > 0) {
+                if (minutesCounter % 3 == 0) {
+                    burnInOffsetX = Random.nextInt(-18, 19)
+                    burnInOffsetY = Random.nextInt(-14, 15)
                 }
 
-                try {
-                    val bm = context.registerReceiver(null, IntentFilter(ACTION_BATTERY_CHANGED))
-                    val level = bm?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-                    val scale = bm?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-                    val status = bm?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
-                    if (level >= 0 && scale > 0) {
-                        batteryPct = (level * 100) / scale
-                    }
-                    isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
-                            status == BatteryManager.BATTERY_STATUS_FULL
-                } catch (_: Exception) {}
+                if (autoCycleOled && minutesCounter % 5 == 0) {
+                    val otherClocks = DigitalClockStyle.entries.filter { it != clockStyle }
+                    clockStyle = otherClocks.random()
 
-                delay(2500L)
-                isAnimating = false
+                    calendarStyle = CalendarLayoutStyle.entries[
+                        (calendarStyle.ordinal + 1) % CalendarLayoutStyle.entries.size
+                    ]
+                }
             }
-            delay(1000L)
+            minutesCounter++
+
+            try {
+                val bm = context.registerReceiver(null, IntentFilter(ACTION_BATTERY_CHANGED))
+                val level = bm?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                val scale = bm?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+                val status = bm?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+                if (level >= 0 && scale > 0) {
+                    batteryPct = (level * 100) / scale
+                }
+                isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                        status == BatteryManager.BATTERY_STATUS_FULL
+            } catch (_: Exception) {}
+
+            val sleepMs = 60_000L - (System.currentTimeMillis() % 60_000L) + 50L
+            delay(sleepMs)
         }
     }
 
@@ -492,7 +519,7 @@ fun StandByScreen(
                 currentDate = currentDate,
                 batteryPct = batteryPct,
                 isCharging = isCharging,
-                ambientLux = ambientLux,
+                ambientLux = if (rightWidget == RightWidget.BATTERY_INFO) ambientLux else 0f,
                 targetBrightnessPct = (targetBrightness * 100).toInt(),
                 primaryColor = primaryColor,
                 accentColor = accentColor,
@@ -522,7 +549,6 @@ fun StandByScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 TextButton(onClick = {
-                    isAnimating = true
                     clockStyle = DigitalClockStyle.entries[
                         (clockStyle.ordinal + 1) % DigitalClockStyle.entries.size
                     ]
@@ -533,7 +559,6 @@ fun StandByScreen(
                 }
 
                 TextButton(onClick = {
-                    isAnimating = true
                     calendarStyle = CalendarLayoutStyle.entries[
                         (calendarStyle.ordinal + 1) % CalendarLayoutStyle.entries.size
                     ]
@@ -615,30 +640,46 @@ fun StandByScreen(
     }
 }
 
+/**
+ * Пассивный измеритель FPS через OnFrameMetricsAvailableListener.
+ * В отличие от Choreographer.postFrameCallback, НЕ принуждает систему рисовать 60 кадров в секунду,
+ * а считает только реально отрисованные кадры приложения (в покое показывает 0–1 FPS).
+ */
 @Composable
 fun FpsMeter(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
     var fps by remember { mutableIntStateOf(0) }
+    val renderedFrames = remember { AtomicInteger(0) }
 
-    DisposableEffect(Unit) {
-        var frameCount = 0
-        var lastTime = System.nanoTime()
-
-        val callback = object : Choreographer.FrameCallback {
-            override fun doFrame(frameTimeNanos: Long) {
-                frameCount++
-                val elapsed = frameTimeNanos - lastTime
-                if (elapsed >= 1_000_000_000L) {
-                    fps = ((frameCount * 1_000_000_000L) / elapsed).toInt()
-                    frameCount = 0
-                    lastTime = frameTimeNanos
-                }
-                Choreographer.getInstance().postFrameCallback(this)
+    DisposableEffect(context) {
+        val window = (context as? Activity)?.window
+        val handler = Handler(Looper.getMainLooper())
+        val listener = Window.OnFrameMetricsAvailableListener { _, _, _ ->
+            renderedFrames.incrementAndGet()
+        }
+        if (window != null) {
+            try {
+                window.addOnFrameMetricsAvailableListener(listener, handler)
+            } catch (_: Exception) {}
+        }
+        onDispose {
+            if (window != null) {
+                try {
+                    window.removeOnFrameMetricsAvailableListener(listener)
+                } catch (_: Exception) {}
             }
         }
-        Choreographer.getInstance().postFrameCallback(callback)
+    }
 
-        onDispose {
-            Choreographer.getInstance().removeFrameCallback(callback)
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1000L)
+            val count = renderedFrames.getAndSet(0)
+            // Не учитываем 1 кадр, если он был вызван самим обновлением текста счетчика
+            val actualFps = if (count <= 1) 1 else count
+            if (fps != actualFps) {
+                fps = actualFps
+            }
         }
     }
 
@@ -674,8 +715,8 @@ fun ClockContainer(
         AnimatedContent(
             targetState = clockStyle,
             transitionSpec = {
-                fadeIn(animationSpec = tween(2000)) togetherWith
-                        fadeOut(animationSpec = tween(2000))
+                fadeIn(animationSpec = tween(600)) togetherWith
+                        fadeOut(animationSpec = tween(600))
             },
             label = "ClockStyleCrossfade"
         ) { targetStyle ->
@@ -713,8 +754,8 @@ fun WidgetContainer(
                 AnimatedContent(
                     targetState = calendarStyle,
                     transitionSpec = {
-                        fadeIn(animationSpec = tween(2000)) togetherWith
-                                fadeOut(animationSpec = tween(2000))
+                        fadeIn(animationSpec = tween(600)) togetherWith
+                                fadeOut(animationSpec = tween(600))
                     },
                     label = "CalendarStyleCrossfade"
                 ) { style ->
@@ -757,9 +798,9 @@ fun CalendarLayoutTopView(
     primaryColor: Color,
     accentColor: Color
 ) {
-    val ruLocale = Locale("ru", "RU")
-    val dayOfWeek = date.dayOfWeek.getDisplayName(TextStyle.FULL, ruLocale).uppercase(ruLocale)
-    val monthName = date.month.getDisplayName(TextStyle.FULL_STANDALONE, ruLocale).uppercase(ruLocale)
+    val ruLocale = remember { Locale("ru", "RU") }
+    val dayOfWeek = remember(date) { date.dayOfWeek.getDisplayName(TextStyle.FULL, ruLocale).uppercase(ruLocale) }
+    val monthName = remember(date) { date.month.getDisplayName(TextStyle.FULL_STANDALONE, ruLocale).uppercase(ruLocale) }
 
     Column(
         modifier = Modifier.fillMaxSize(),
@@ -789,9 +830,9 @@ fun CalendarLayoutBottomView(
     primaryColor: Color,
     accentColor: Color
 ) {
-    val ruLocale = Locale("ru", "RU")
-    val dayOfWeek = date.dayOfWeek.getDisplayName(TextStyle.FULL, ruLocale).uppercase(ruLocale)
-    val monthName = date.month.getDisplayName(TextStyle.FULL_STANDALONE, ruLocale).uppercase(ruLocale)
+    val ruLocale = remember { Locale("ru", "RU") }
+    val dayOfWeek = remember(date) { date.dayOfWeek.getDisplayName(TextStyle.FULL, ruLocale).uppercase(ruLocale) }
+    val monthName = remember(date) { date.month.getDisplayName(TextStyle.FULL_STANDALONE, ruLocale).uppercase(ruLocale) }
 
     Column(
         modifier = Modifier.fillMaxSize(),
@@ -824,12 +865,12 @@ fun MonthGridWidget(
     primaryColor: Color,
     accentColor: Color
 ) {
-    val yearMonth = YearMonth.from(date)
+    val yearMonth = remember(date.year, date.monthValue) { YearMonth.from(date) }
     val daysInMonth = yearMonth.lengthOfMonth()
     val firstDayOffset = yearMonth.atDay(1).dayOfWeek.value - 1
 
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        val weekDays = listOf("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС")
+        val weekDays = remember { listOf("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС") }
         Row(modifier = Modifier.fillMaxWidth()) {
             weekDays.forEach { d ->
                 Text(
