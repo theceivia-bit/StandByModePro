@@ -1,6 +1,5 @@
 package com.custom.standbymodepro
 
-import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -23,10 +22,6 @@ import android.view.Window
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
-import android.webkit.CookieManager
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedContent
@@ -34,15 +29,12 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -68,7 +60,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -239,7 +230,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         } catch (_: Exception) {}
     }
 
-    override fun onResume() {
+  override fun onResume() {
         super.onResume()
         portraitEnterTime = 0L
         StandByService.isActivityActive = true
@@ -275,7 +266,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         } catch (_: Exception) {}
     }
 
-    override fun onSensorChanged(event: SensorEvent?) {
+override fun onSensorChanged(event: SensorEvent?) {
         if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
             val x = event.values[0]
             val y = event.values[1]
@@ -306,8 +297,7 @@ enum class DigitalClockStyle(val title: String) {
     TERMINAL("Терминал")
 }
 
-// Единая ротация правой панели: 2 календаря и 2 виджета погоды чередуют друг друга.
-// Telegram сюда НЕ входит и никогда не участвует в авто-ротации.
+// Единая ротация правой панели: 2 календаря и 2 виджета погоды чередуют друг друга
 enum class RightPanelMode(val title: String) {
     CALENDAR_TOP("Календарь 1"),
     WEATHER_CURRENT("Погода: Сейчас"),
@@ -381,10 +371,6 @@ fun StandByScreen(
     }
     var swipeDirection by remember { mutableIntStateOf(1) }
 
-    // Независимое состояние окна Telegram (открывается и закрывается только свайпом влево/вправо)
-    var isTelegramOpen by remember { mutableStateOf(false) }
-    var horizontalSwipeDir by remember { mutableIntStateOf(1) }
-
     var autoCycleOled by remember {
         mutableStateOf(prefs.getBoolean("auto_cycle_oled", true))
     }
@@ -431,18 +417,15 @@ fun StandByScreen(
         }
     }
 
-    // Повышаем частоту обновления только во время короткой анимации ИЛИ когда открыт Telegram.
-    // Когда Telegram закрыт и анимация завершена — возвращаем 1 FPS для экономии АКБ.
-    LaunchedEffect(isAnimating, isTelegramOpen) {
+    LaunchedEffect(isAnimating) {
         val activity = context as? Activity ?: return@LaunchedEffect
         val window = activity.window
         val params = window.attributes
-        val needActiveRefresh = isAnimating || isTelegramOpen
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val modes = activity.display?.supportedModes
             if (!modes.isNullOrEmpty()) {
-                val targetMode = if (needActiveRefresh) {
+                val targetMode = if (isAnimating) {
                     modes.filter { it.refreshRate <= 60.1f }.maxByOrNull { it.refreshRate }
                         ?: modes.minByOrNull { it.refreshRate }
                 } else {
@@ -453,11 +436,11 @@ fun StandByScreen(
                 }
             }
         }
-        params.preferredRefreshRate = if (isTelegramOpen) 60f else if (isAnimating) 30f else 1f
+        params.preferredRefreshRate = if (isAnimating) 30f else 1f
         window.attributes = params
     }
 
-    LaunchedEffect(clockStyle, rightPanelMode, themeIndex, isTelegramOpen) {
+    LaunchedEffect(clockStyle, rightPanelMode, themeIndex) {
         isAnimating = true
         delay(700L)
         isAnimating = false
@@ -516,6 +499,7 @@ fun StandByScreen(
         animationSpec = tween(500),
         label = "accentColor"
     )
+
     LaunchedEffect(autoCycleOled) {
         var minutesCounter = 0
         while (true) {
@@ -532,7 +516,6 @@ fun StandByScreen(
                     val otherClocks = DigitalClockStyle.entries.filter { it != clockStyle }
                     clockStyle = otherClocks.random()
 
-                    // Ротация правой панели крутит только календари и погоду
                     swipeDirection = 1
                     rightPanelMode = RightPanelMode.entries[
                         (rightPanelMode.ordinal + 1) % RightPanelMode.entries.size
@@ -566,65 +549,35 @@ fun StandByScreen(
     }
 
     var verticalDragSum by remember { mutableFloatStateOf(0f) }
-    var verticalSwipeHandled by remember { mutableStateOf(false) }
-
-    var horizontalDragSum by remember { mutableFloatStateOf(0f) }
-    var horizontalSwipeHandled by remember { mutableStateOf(false) }
+    var swipeHandledInGesture by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF000000))
-            // Вертикальный свайп переключает календари/погоду только когда Telegram закрыт
-            .pointerInput(isTelegramOpen) {
-                if (!isTelegramOpen) {
-                    detectVerticalDragGestures(
-                        onDragStart = {
-                            verticalDragSum = 0f
-                            verticalSwipeHandled = false
-                        },
-                        onVerticalDrag = { change, dragAmount ->
-                            change.consume()
-                            if (!verticalSwipeHandled) {
-                                verticalDragSum += dragAmount
-                                if (verticalDragSum < -55f) {
-                                    verticalSwipeHandled = true
-                                    swipeDirection = 1
-                                    rightPanelMode = RightPanelMode.entries[
-                                        (rightPanelMode.ordinal + 1) % RightPanelMode.entries.size
-                                    ]
-                                } else if (verticalDragSum > 55f) {
-                                    verticalSwipeHandled = true
-                                    swipeDirection = -1
-                                    val size = RightPanelMode.entries.size
-                                    rightPanelMode = RightPanelMode.entries[
-                                        (rightPanelMode.ordinal - 1 + size) % size
-                                    ]
-                                }
-                            }
-                        }
-                    )
-                }
-            }
-            // Горизонтальный свайп влево/вправо открывает Telegram и возвращает ротацию обратно
-            .pointerInput(isTelegramOpen) {
-                detectHorizontalDragGestures(
+            .pointerInput(Unit) {
+                detectVerticalDragGestures(
                     onDragStart = {
-                        horizontalDragSum = 0f
-                        horizontalSwipeHandled = false
+                        verticalDragSum = 0f
+                        swipeHandledInGesture = false
                     },
-                    onHorizontalDrag = { change, dragAmount ->
+                    onVerticalDrag = { change, dragAmount ->
                         change.consume()
-                        if (!horizontalSwipeHandled) {
-                            horizontalDragSum += dragAmount
-                            if (horizontalDragSum < -65f) {
-                                horizontalSwipeHandled = true
-                                horizontalSwipeDir = 1
-                                isTelegramOpen = !isTelegramOpen
-                            } else if (horizontalDragSum > 65f) {
-                                horizontalSwipeHandled = true
-                                horizontalSwipeDir = -1
-                                isTelegramOpen = !isTelegramOpen
+                        if (!swipeHandledInGesture) {
+                            verticalDragSum += dragAmount
+                            if (verticalDragSum < -55f) {
+                                swipeHandledInGesture = true
+                                swipeDirection = 1
+                                rightPanelMode = RightPanelMode.entries[
+                                    (rightPanelMode.ordinal + 1) % RightPanelMode.entries.size
+                                ]
+                            } else if (verticalDragSum > 55f) {
+                                swipeHandledInGesture = true
+                                swipeDirection = -1
+                                val size = RightPanelMode.entries.size
+                                rightPanelMode = RightPanelMode.entries[
+                                    (rightPanelMode.ordinal - 1 + size) % size
+                                ]
                             }
                         }
                     }
@@ -640,9 +593,8 @@ fun StandByScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer {
-                    // Когда открыт Telegram, отключаем сдвиг для четкости текста в мессенджере
-                    translationX = if (isTelegramOpen) 0f else burnInOffsetX.toFloat()
-                    translationY = if (isTelegramOpen) 0f else burnInOffsetY.toFloat()
+                    translationX = burnInOffsetX.toFloat()
+                    translationY = burnInOffsetY.toFloat()
                 },
             horizontalArrangement = Arrangement.spacedBy(24.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -659,12 +611,6 @@ fun StandByScreen(
             WidgetContainer(
                 rightPanelMode = rightPanelMode,
                 swipeDirection = swipeDirection,
-                isTelegramOpen = isTelegramOpen,
-                horizontalSwipeDir = horizontalSwipeDir,
-                onSwipeToggleTelegram = { dir ->
-                    horizontalSwipeDir = dir
-                    isTelegramOpen = !isTelegramOpen
-                },
                 currentDate = currentDate,
                 batteryPct = batteryPct,
                 isCharging = isCharging,
@@ -721,22 +667,14 @@ fun StandByScreen(
                 }
 
                 TextButton(onClick = {
-                    if (isTelegramOpen) {
-                        isTelegramOpen = false
-                    } else {
-                        swipeDirection = 1
-                        rightPanelMode = RightPanelMode.entries[
-                            (rightPanelMode.ordinal + 1) % RightPanelMode.entries.size
-                        ]
-                    }
+                    swipeDirection = 1
+                    rightPanelMode = RightPanelMode.entries[
+                        (rightPanelMode.ordinal + 1) % RightPanelMode.entries.size
+                    ]
                 }) {
                     Icon(Icons.Default.Widgets, contentDescription = null, tint = Color.White)
                     Spacer(Modifier.width(5.dp))
-                    Text(
-                        text = if (isTelegramOpen) "Панель: Telegram" else "Панель: ${rightPanelMode.title}",
-                        color = Color.White,
-                        fontSize = 12.sp
-                    )
+                    Text("Панель: ${rightPanelMode.title}", color = Color.White, fontSize = 12.sp)
                 }
 
                 TextButton(onClick = { autoCycleOled = !autoCycleOled }) {
@@ -800,7 +738,6 @@ fun StandByScreen(
         }
     }
 }
-
 /**
  * Пассивный измеритель FPS через OnFrameMetricsAvailableListener.
  */
@@ -892,9 +829,6 @@ fun ClockContainer(
 fun WidgetContainer(
     rightPanelMode: RightPanelMode,
     swipeDirection: Int,
-    isTelegramOpen: Boolean,
-    horizontalSwipeDir: Int,
-    onSwipeToggleTelegram: (Int) -> Unit,
     currentDate: LocalDate,
     batteryPct: Int,
     isCharging: Boolean,
@@ -908,201 +842,58 @@ fun WidgetContainer(
     Box(
         modifier = modifier
             .fillMaxHeight()
-            .padding(if (isTelegramOpen) 4.dp else 16.dp),
+            .padding(16.dp),
         contentAlignment = Alignment.Center
     ) {
-        // Горизонтальное переключение между ротационными виджетами и окном Telegram
         AnimatedContent(
-            targetState = isTelegramOpen,
+            targetState = rightPanelMode,
             transitionSpec = {
-                val hDir = if (horizontalSwipeDir >= 0) 1 else -1
-                (slideInHorizontally(animationSpec = tween(450)) { width -> hDir * width } +
-                        fadeIn(animationSpec = tween(450))) togetherWith
-                        (slideOutHorizontally(animationSpec = tween(450)) { width -> -hDir * width } +
-                                fadeOut(animationSpec = tween(450)))
+                val dir = if (swipeDirection >= 0) 1 else -1
+                (slideInVertically(animationSpec = tween(550)) { height -> dir * height / 3 } +
+                        fadeIn(animationSpec = tween(550))) togetherWith
+                        (slideOutVertically(animationSpec = tween(550)) { height -> -dir * height / 3 } +
+                                fadeOut(animationSpec = tween(550)))
             },
-            label = "TelegramHorizontalSwitch"
-        ) { telegramActive ->
-            if (telegramActive) {
-                TelegramWebPanel(
+            label = "RightPanelCrossfade"
+        ) { mode ->
+            when (mode) {
+                RightPanelMode.CALENDAR_TOP -> CalendarLayoutTopView(
+                    date = currentDate,
+                    batteryPct = batteryPct,
+                    isCharging = isCharging,
                     primaryColor = primaryColor,
-                    accentColor = accentColor,
-                    onSwipeBack = { dir -> onSwipeToggleTelegram(dir) }
+                    accentColor = accentColor
                 )
-            } else {
-                // Стандартная вертикальная ротация календарей и погоды
-                AnimatedContent(
-                    targetState = rightPanelMode,
-                    transitionSpec = {
-                        val dir = if (swipeDirection >= 0) 1 else -1
-                        (slideInVertically(animationSpec = tween(550)) { height -> dir * height / 3 } +
-                                fadeIn(animationSpec = tween(550))) togetherWith
-                                (slideOutVertically(animationSpec = tween(550)) { height -> -dir * height / 3 } +
-                                        fadeOut(animationSpec = tween(550)))
-                    },
-                    label = "RightPanelCrossfade"
-                ) { mode ->
-                    when (mode) {
-                        RightPanelMode.CALENDAR_TOP -> CalendarLayoutTopView(
-                            date = currentDate,
-                            batteryPct = batteryPct,
-                            isCharging = isCharging,
-                            primaryColor = primaryColor,
-                            accentColor = accentColor
-                        )
-                        RightPanelMode.WEATHER_CURRENT -> WeatherCurrentDetailedView(
-                            weather = weatherData,
-                            isLoading = isWeatherLoading,
-                            onRefresh = onRefreshWeather,
-                            batteryPct = batteryPct,
-                            isCharging = isCharging,
-                            primaryColor = primaryColor,
-                            accentColor = accentColor
-                        )
-                        RightPanelMode.CALENDAR_BOTTOM -> CalendarLayoutBottomView(
-                            date = currentDate,
-                            batteryPct = batteryPct,
-                            isCharging = isCharging,
-                            primaryColor = primaryColor,
-                            accentColor = accentColor
-                        )
-                        RightPanelMode.WEATHER_FORECAST -> WeatherForecastGridView(
-                            weather = weatherData,
-                            isLoading = isWeatherLoading,
-                            onRefresh = onRefreshWeather,
-                            batteryPct = batteryPct,
-                            isCharging = isCharging,
-                            primaryColor = primaryColor,
-                            accentColor = accentColor
-                        )
-                    }
-                }
+                RightPanelMode.WEATHER_CURRENT -> WeatherCurrentDetailedView(
+                    weather = weatherData,
+                    isLoading = isWeatherLoading,
+                    onRefresh = onRefreshWeather,
+                    batteryPct = batteryPct,
+                    isCharging = isCharging,
+                    primaryColor = primaryColor,
+                    accentColor = accentColor
+                )
+                RightPanelMode.CALENDAR_BOTTOM -> CalendarLayoutBottomView(
+                    date = currentDate,
+                    batteryPct = batteryPct,
+                    isCharging = isCharging,
+                    primaryColor = primaryColor,
+                    accentColor = accentColor
+                )
+                RightPanelMode.WEATHER_FORECAST -> WeatherForecastGridView(
+                    weather = weatherData,
+                    isLoading = isWeatherLoading,
+                    onRefresh = onRefreshWeather,
+                    batteryPct = batteryPct,
+                    isCharging = isCharging,
+                    primaryColor = primaryColor,
+                    accentColor = accentColor
+                )
             }
         }
     }
 }
 
-/**
- * Окно Telegram с нулевым расходом АКБ в закрытом состоянии.
- * Существует в памяти только тогда, когда открыто пользователем.
- * При свайпе обратно к календарям/погоде полностью останавливает таймеры, сеть и рендер.
- */
-@SuppressLint("SetJavaScriptEnabled")
-@Composable
-fun TelegramWebPanel(
-    primaryColor: Color,
-    accentColor: Color,
-    onSwipeBack: (Int) -> Unit
-) {
-    var headerDragSum by remember { mutableFloatStateOf(0f) }
-    var headerSwipeHandled by remember { mutableStateOf(false) }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .clip(RoundedCornerShape(22.dp))
-            .border(1.dp, primaryColor.copy(alpha = 0.25f), RoundedCornerShape(22.dp))
-            .background(Color(0xFF000000))
-    ) {
-        // Верхняя полоса управления: поддерживает свайп влево/вправо для возврата к календарям/погоде
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFF121214))
-                .pointerInput(Unit) {
-                    detectHorizontalDragGestures(
-                        onDragStart = {
-                            headerDragSum = 0f
-                            headerSwipeHandled = false
-                        },
-                        onHorizontalDrag = { change, dragAmount ->
-                            change.consume()
-                            if (!headerSwipeHandled) {
-                                headerDragSum += dragAmount
-                                if (headerDragSum < -50f) {
-                                    headerSwipeHandled = true
-                                    onSwipeBack(1)
-                                } else if (headerDragSum > 50f) {
-                                    headerSwipeHandled = true
-                                    onSwipeBack(-1)
-                                }
-                            }
-                        }
-                    )
-                }
-                .padding(horizontal = 14.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.SwapHoriz,
-                    contentDescription = null,
-                    tint = accentColor,
-                    modifier = Modifier.size(16.dp)
-                )
-                Text(
-                    text = "TELEGRAM • СВАЙП ВЛЕВО/ВПРАВО",
-                    color = accentColor,
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.sp
-                )
-            }
-
-            Text(
-                text = "К ВИДЖЕТАМ ✕",
-                color = primaryColor.copy(alpha = 0.75f),
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.clickable { onSwipeBack(-1) }
-            )
-        }
-
-AndroidView(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            factory = { ctx ->
-                WebView(ctx).apply {
-                    setBackgroundColor(android.graphics.Color.BLACK)
-                    settings.apply {
-                        javaScriptEnabled = true
-                        domStorageEnabled = true // Сохраняет сессию авторизации на диске
-                        databaseEnabled = true
-                        cacheMode = WebSettings.LOAD_DEFAULT
-                        useWideViewPort = true
-                        loadWithOverviewMode = true
-                        mediaPlaybackRequiresUserGesture = true
-                    }
-                    
-                    // Исправление: сначала включаем глобальные куки, а затем разрешаем сторонние для WebView
-                    CookieManager.getInstance().setAcceptCookie(true)
-                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-
-                    webViewClient = WebViewClient()
-                    onResume()
-                    resumeTimers()
-                    loadUrl("https://web.telegram.org/k/")
-                }
-            },
-            onRelease = { webView ->
-                // Гарантирует 0% расхода батареи и сети после закрытия окна Telegram
-                try {
-                    CookieManager.getInstance().flush()
-                    webView.stopLoading()
-                    webView.onPause()
-                    webView.pauseTimers()
-                    webView.removeAllViews()
-                    webView.destroy()
-                } catch (_: Exception) {}
-            }
-        )
-    }
-}
 @Composable
 fun CalendarLayoutTopView(
     date: LocalDate,
@@ -1235,6 +1026,7 @@ fun MonthGridWidget(
 
 /**
  * Виджет погоды №1: Крупная текущая погода в г. Павлово с подробными параметрами
+ * (ощущается как, ветер, влажность, давление в мм рт. ст.).
  */
 @Composable
 fun WeatherCurrentDetailedView(
@@ -1382,7 +1174,7 @@ fun WeatherMetricItem(
 }
 
 /**
- * Виджет погоды №2: Прогноз на 4 дня по г. Павлово
+ * Виджет погоды №2: Прогноз на 4 дня по г. Павлово в виде карточек + компактная сводка сверху.
  */
 @Composable
 fun WeatherForecastGridView(
@@ -1508,7 +1300,7 @@ fun WeatherForecastGridView(
                 verticalAlignment = Alignment.Bottom
             ) {
                 Text(
-                    text = "Свайп влево/вправо — Telegram",
+                    text = "Свайп вверх/вниз — смена виджета",
                     color = primaryColor.copy(alpha = 0.35f),
                     fontSize = 10.sp
                 )
@@ -1549,6 +1341,10 @@ private fun weatherConditionIcon(code: Int): ImageVector = when (code) {
     else -> Icons.Default.CloudQueue
 }
 
+/**
+ * Запрашивает погоду напрямую по координатам г. Павлово (Нижегородская область):
+ * 55.9619° N, 43.0900° E. Не зависит от страны VPN.
+ */
 private suspend fun fetchPavlovoWeatherRawJson(): String? = withContext(Dispatchers.IO) {
     var connection: HttpURLConnection? = null
     try {
