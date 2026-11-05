@@ -1062,7 +1062,7 @@ fun TelegramWebPanel(
             )
         }
 
-        AndroidView(
+AndroidView(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f),
@@ -1078,10 +1078,11 @@ fun TelegramWebPanel(
                         loadWithOverviewMode = true
                         mediaPlaybackRequiresUserGesture = true
                     }
-                    CookieManager.getInstance().apply {
-                        setAcceptCookie(true)
-                        setAcceptThirdPartyCookies(this@apply, true)
-                    }
+                    
+                    // Исправление: сначала включаем глобальные куки, а затем разрешаем сторонние для WebView
+                    CookieManager.getInstance().setAcceptCookie(true)
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
                     webViewClient = WebViewClient()
                     onResume()
                     resumeTimers()
