@@ -44,6 +44,8 @@ class StandByService : Service(), SensorEventListener {
     private var landscapeEnterTime = 0L
     private var standbyLaunchedInCurrentCycle = false
 
+    // Разрешает автозапуск ТОЛЬКО после выключения экрана (ACTION_SCREEN_OFF).
+    // Сбрасывается сразу после закрытия часов при включенном экране или при разблокировке.
     private var isLockedSessionActive = false
 
     private val releaseActiveWindowRunnable = Runnable {
@@ -86,6 +88,7 @@ class StandByService : Service(), SensorEventListener {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 Intent.ACTION_SCREEN_OFF -> {
+                    // Экран погас — начинаем новую сессию ожидания поворота
                     isLockedSessionActive = true
                     standbyLaunchedInCurrentCycle = false
                     if (!isActivityActive) {
@@ -104,8 +107,6 @@ class StandByService : Service(), SensorEventListener {
                         stopSensorMonitoring()
                         sendForceCloseToActivity()
                     } else if (isLockedSessionActive && !isActivityActive) {
-                        // Когда пользователь нажал кнопку питания или разбудил экран блокировки —
-                        // активно слушаем акселерометр 45 секунд без задержек
                         startSensorMonitoring()
                     }
                 }
@@ -115,10 +116,16 @@ class StandByService : Service(), SensorEventListener {
                 }
                 ACTION_ACTIVITY_PAUSED -> {
                     isActivityActive = false
-                    if (isLockedSessionActive && isPhoneReallyLocked()) {
+                    // КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ:
+                    // Когда пользователь повернул телефон вертикально и закрыл часы, пока экран горит (interactive == true),
+                    // мы полностью завершаем сессию до следующего выключения экрана кнопкой блокировки (ACTION_SCREEN_OFF).
+                    // Благодаря этому после свайпа разблокировки часы НИКОГДА не откроются поверх YouTube!
+                    val isScreenOff = powerManager?.isInteractive == false
+                    if (isScreenOff && isLockedSessionActive) {
                         startSensorMonitoring()
                     } else {
                         isLockedSessionActive = false
+                        standbyLaunchedInCurrentCycle = false
                         stopSensorMonitoring()
                     }
                 }
@@ -131,7 +138,6 @@ class StandByService : Service(), SensorEventListener {
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
         accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
 
-        // TYPE_TILT_DETECTOR = 22, TYPE_PICK_UP_GESTURE = 25, TYPE_DEVICE_ORIENTATION = 27
         tiltDetectorSensor = sensorManager?.getDefaultSensor(22, true)
             ?: sensorManager?.getDefaultSensor(22)
         pickUpSensor = sensorManager?.getDefaultSensor(25, true)
@@ -174,13 +180,14 @@ class StandByService : Service(), SensorEventListener {
         } catch (_: Exception) {}
     }
 
+    @Suppress("DEPRECATION")
     private fun isPhoneReallyLocked(): Boolean {
         val interactive = powerManager?.isInteractive ?: true
-        if (!interactive) return true
+        if (!interactive) return true // Экран полностью погашен
 
-        val keyguardLocked = keyguardManager?.isKeyguardLocked ?: false
-        val deviceLocked = keyguardManager?.isDeviceLocked ?: false
-        return keyguardLocked || deviceLocked
+        // Если экран включен, проверяем все системные флаги экрана блокировки
+        val km = keyguardManager ?: return false
+        return km.isKeyguardLocked || km.isDeviceLocked || km.inKeyguardRestrictedInputMode()
     }
 
     private fun hasHardwareWakeSensors(): Boolean {
@@ -241,7 +248,6 @@ class StandByService : Service(), SensorEventListener {
             }
         }
 
-        // Окно быстрого опроса 45 секунд после блокировки экрана (когда пользователь ставит телефон на подставку)
         startActiveAccelerometerWindow(45_000L)
     }
 
@@ -272,7 +278,6 @@ class StandByService : Service(), SensorEventListener {
 
         if (!isAccelerometerActive) {
             isAccelerometerActive = true
-            // Опрос 4 раза в секунду (250_000 мкс) БЕЗ буфера задержки (0 мкс) для четкого срабатывания
             accelerometer?.let {
                 sensorManager?.registerListener(this, it, 250_000, 0)
             }
@@ -318,12 +323,13 @@ class StandByService : Service(), SensorEventListener {
 
         val sensorType = event?.sensor?.type ?: return
 
-        // Аппаратный датчик ориентации (27): 1 или 3 = горизонтально, 0 или 2 = вертикально
         if (sensorType == 27 && event.values.isNotEmpty()) {
             val orientation = event.values[0].toInt()
             if (orientation == 1 || orientation == 3) {
-                if (!standbyLaunchedInCurrentCycle && Settings.canDrawOverlays(this)) {
+                if (!standbyLaunchedInCurrentCycle && Settings.canDrawOverlays(this) && isPhoneReallyLocked()) {
                     standbyLaunchedInCurrentCycle = true
+                    // Сразу гасим сессию после первого запуска, чтобы повторно без блокировки экрана она не сработала
+                    isLockedSessionActive = false
                     stopSensorMonitoring()
                     wakeUpAndLaunchStandBy()
                     return
@@ -335,7 +341,6 @@ class StandByService : Service(), SensorEventListener {
             return
         }
 
-        // Датчик наклона (22) будит активное окно акселерометра на 30 секунд
         if (sensorType == 22) {
             startActiveAccelerometerWindow(30_000L)
             return
@@ -347,7 +352,6 @@ class StandByService : Service(), SensorEventListener {
         val y = event.values[1]
         val z = event.values[2]
 
-        // Оптимальные углы: уверенно ловит альбомный поворот даже на наклонной подставке (z до 8.4)
         val isLandscape = abs(x) > 5.8f && abs(y) < 4.5f && abs(z) < 8.4f && abs(x) > abs(y) * 1.3f
         val isPortrait = abs(y) > 5.2f && abs(y) > abs(x) * 1.15f
 
@@ -359,6 +363,8 @@ class StandByService : Service(), SensorEventListener {
             } else if (now - landscapeEnterTime >= 250L && !standbyLaunchedInCurrentCycle) {
                 if (Settings.canDrawOverlays(this) && isLockedSessionActive && isPhoneReallyLocked()) {
                     standbyLaunchedInCurrentCycle = true
+                    // Сразу сбрасываем сессию: 1 блокировка экрана = максимум 1 автозапуск
+                    isLockedSessionActive = false
                     stopSensorMonitoring()
                     wakeUpAndLaunchStandBy()
                 }
@@ -373,7 +379,7 @@ class StandByService : Service(), SensorEventListener {
 
     @Suppress("DEPRECATION")
     private fun wakeUpAndLaunchStandBy() {
-        if (!isLockedSessionActive || !isPhoneReallyLocked()) return
+        if (!isPhoneReallyLocked()) return
 
         try {
             val screenWake = powerManager?.newWakeLock(
