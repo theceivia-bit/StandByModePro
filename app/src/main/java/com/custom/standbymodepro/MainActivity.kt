@@ -93,8 +93,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private var portraitEnterTime = 0L
 
+    // Принудительно закрывает окно и полностью выгружает задачу из списка недавних (Recents)
     private val closeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
+            closeAndRemoveFromRecents()
+        }
+    }
+
+    private fun closeAndRemoveFromRecents() {
+        try {
+            finishAndRemoveTask()
+        } catch (_: Exception) {
             finish()
         }
     }
@@ -131,11 +140,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         lightSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_LIGHT)
         accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
 
+        // Слушаем как команду закрытия от сервиса, так и системное событие разблокировки смартфона
         try {
+            val filter = IntentFilter("com.custom.standbymodepro.ACTION_CLOSE_STANDBY").apply {
+                addAction(Intent.ACTION_USER_PRESENT)
+            }
             ContextCompat.registerReceiver(
                 this,
                 closeReceiver,
-                IntentFilter("com.custom.standbymodepro.ACTION_CLOSE_STANDBY"),
+                filter,
                 ContextCompat.RECEIVER_NOT_EXPORTED
             )
         } catch (_: Exception) {}
@@ -236,6 +249,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sendBroadcast(Intent(StandByService.ACTION_ACTIVITY_PAUSED).setPackage(packageName))
     }
 
+    override fun onStop() {
+        super.onStop()
+        // Если часы свернулись в фон или пользователь вышел на рабочий стол —
+        // немедленно уничтожаем окно, чтобы оно не висело в памяти и не всплывало при поворотах
+        closeAndRemoveFromRecents()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out)
@@ -256,7 +276,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 if (portraitEnterTime == 0L) {
                     portraitEnterTime = now
                 } else if (now - portraitEnterTime > 400L) {
-                    finish()
+                    closeAndRemoveFromRecents()
                 }
             } else {
                 portraitEnterTime = 0L
@@ -346,7 +366,6 @@ fun StandByScreen(
         val saved = prefs.getInt("right_panel_mode", 0).coerceIn(0, RightPanelMode.entries.lastIndex)
         mutableStateOf(RightPanelMode.entries[saved])
     }
-    // Направление анимации при свайпе: 1 (вверх -> следующий), -1 (вниз -> предыдущий)
     var swipeDirection by remember { mutableIntStateOf(1) }
 
     var autoCycleOled by remember {
@@ -385,7 +404,6 @@ fun StandByScreen(
         }
     }
 
-    // Опрос датчика света только при включенном АВТО-режиме яркости
     val shouldPollLight = brightnessMode == BrightnessMode.AUTO
     LaunchedEffect(shouldPollLight) {
         if (shouldPollLight) {
@@ -396,7 +414,6 @@ fun StandByScreen(
         }
     }
 
-    // Управление частотой экрана: 1 Гц в покое, 30 Гц во время анимации переключения
     LaunchedEffect(isAnimating) {
         val activity = context as? Activity ?: return@LaunchedEffect
         val window = activity.window
@@ -480,7 +497,6 @@ fun StandByScreen(
         label = "accentColor"
     )
 
-    // Минутный цикл: обновление времени, сдвиг от выгорания и ротация календарей с погодой
     LaunchedEffect(autoCycleOled) {
         var minutesCounter = 0
         while (true) {
@@ -547,14 +563,12 @@ fun StandByScreen(
                         if (!swipeHandledInGesture) {
                             verticalDragSum += dragAmount
                             if (verticalDragSum < -55f) {
-                                // Свайп вверх -> следующий режим (календарь / погода)
                                 swipeHandledInGesture = true
                                 swipeDirection = 1
                                 rightPanelMode = RightPanelMode.entries[
                                     (rightPanelMode.ordinal + 1) % RightPanelMode.entries.size
                                 ]
                             } else if (verticalDragSum > 55f) {
-                                // Свайп вниз -> предыдущий режим (календарь / погода)
                                 swipeHandledInGesture = true
                                 swipeDirection = -1
                                 val size = RightPanelMode.entries.size
