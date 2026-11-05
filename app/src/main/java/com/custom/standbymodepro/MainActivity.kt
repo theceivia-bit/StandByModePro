@@ -230,15 +230,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         } catch (_: Exception) {}
     }
 
-    override fun onResume() {
+  override fun onResume() {
         super.onResume()
         portraitEnterTime = 0L
         StandByService.isActivityActive = true
         sendBroadcast(Intent(StandByService.ACTION_ACTIVITY_RESUMED).setPackage(packageName))
         window.decorView.post { hideSystemUI() }
 
+        // Экран уже включен, поэтому используем SENSOR_DELAY_UI без буфера задержки —
+        // расход энергии не меняется, а реакция на поворот в портрет становится мгновенной
         accelerometer?.let {
-            sensorManager?.registerListener(this, it, 1_000_000, 2_000_000)
+            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
     }
 
@@ -264,18 +266,19 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         } catch (_: Exception) {}
     }
 
-    override fun onSensorChanged(event: SensorEvent?) {
+override fun onSensorChanged(event: SensorEvent?) {
         if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
             val x = event.values[0]
             val y = event.values[1]
 
-            val isPortrait = abs(y) > 6.5f && abs(x) < 4.5f
+            // Более мягкий порог портретного режима (срабатывает даже при наклоне телефона в руке)
+            val isPortrait = abs(y) > 5.2f && abs(y) > abs(x) * 1.15f
             val now = System.currentTimeMillis()
 
             if (isPortrait) {
                 if (portraitEnterTime == 0L) {
                     portraitEnterTime = now
-                } else if (now - portraitEnterTime > 400L) {
+                } else if (now - portraitEnterTime > 180L) {
                     closeAndRemoveFromRecents()
                 }
             } else {
